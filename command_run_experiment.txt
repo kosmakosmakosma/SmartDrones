@@ -1,0 +1,19 @@
+python run_experiment.py 
+  --mode train 
+  --experiment_class DeepReach 
+  --dynamics_class CrazyflieInterception 
+  --experiment_name crazyflie_2d_v1 
+  --minWith target 
+  --target_R 0.25 
+  --capture_R 0.2 
+  --accel_max_a 5.0 
+  --accel_max_d 7.0 
+  --pretrain 
+  --tMax 1.5 
+  --num_epochs 5000
+  --numpoints 10000
+  --use_wandb 
+  --wandb_project SmartDrones 
+  --wandb_entity kosmakosmakosma-tu-delft
+  --wandb_group 2d_drones
+  --wandb_name test1

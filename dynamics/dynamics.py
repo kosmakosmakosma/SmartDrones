@@ -4,6 +4,7 @@ from utils import diff_operators
 import math
 import torch
 
+
 # during training, states will be sampled uniformly by each state dimension from the model-unit -1 to 1 range (for training stability),
 # which may or may not correspond to proper test ranges
 # note that coord refers to [time, *state], and input refers to whatever is fed directly to the model (often [time, *state, params])
@@ -128,6 +129,143 @@ class Dynamics(ABC):
     @abstractmethod
     def plot_config(self):
         raise NotImplementedError
+
+class CrazyflieInterception(Dynamics):
+    def __init__(self, target_R:float, capture_R:float,       # <-- type annotations added
+                 accel_max_a:float, accel_max_d:float):
+        self.target_R = target_R
+        self.capture_R = capture_R
+        self.accel_max_a = accel_max_a
+        self.accel_max_d = accel_max_d
+        self.Gz = -9.8
+
+        pos_range = 2.0
+        vel_range = 3.0
+
+        super().__init__(
+            loss_type='brat_hjivi', set_mode='reach',
+            state_dim=8, input_dim=9,
+            control_dim=2, disturbance_dim=2,  # <-- FIXED: was 3, 3
+            state_mean=[0]*8,
+            state_var=[pos_range, vel_range, pos_range, vel_range,
+                       pos_range, vel_range, pos_range, vel_range],
+            value_mean=0.25,
+            value_var=1.0,
+            value_normto=0.02,
+            deepreach_model='exact',
+        )
+
+    # --- ADDED: required abstract methods ---
+
+    def state_test_range(self):
+        """Defines the real-unit ranges for each state dimension, used in validation plots."""
+        return [
+            [-2.0,  2.0],   # px_a
+            [-3.0,  3.0],   # vx_a
+            [-2.0,  2.0],   # pz_a
+            [-3.0,  3.0],   # vz_a
+            [-2.0,  2.0],   # px_d
+            [-3.0,  3.0],   # vx_d
+            [-2.0,  2.0],   # pz_d
+            [-3.0,  3.0],   # vz_d
+        ]
+
+    def equivalent_wrapped_state(self, state):
+        """No angular states to wrap in double integrator dynamics."""
+        return torch.clone(state)
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        raise NotImplementedError
+
+    # --- Your existing methods (unchanged, assuming they are correct) ---
+
+    def dsdt(self, state, control, disturbance):
+        # state: [px_a, vx_a, pz_a, vz_a, px_d, vx_d, pz_d, vz_d]
+        # control (attacker):     [u_ax, u_az]  — indices 0, 1
+        # disturbance (defender): [d_dx, d_dz]  — indices 0, 1
+        dsdt = torch.zeros_like(state)
+        # Attacker
+        dsdt[..., 0] = state[..., 1]                          # dpx_a/dt = vx_a
+        dsdt[..., 1] = control[..., 0]                        # dvx_a/dt = u_ax
+        dsdt[..., 2] = state[..., 3]                          # dpz_a/dt = vz_a
+        dsdt[..., 3] = control[..., 1] + self.Gz              # dvz_a/dt = u_az + g
+        # Defender
+        dsdt[..., 4] = state[..., 5]                          # dpx_d/dt = vx_d
+        dsdt[..., 5] = disturbance[..., 0]                    # dvx_d/dt = d_dx
+        dsdt[..., 6] = state[..., 7]                          # dpz_d/dt = vz_d
+        dsdt[..., 7] = disturbance[..., 1] + self.Gz          # dvz_d/dt = d_dz + g
+        return dsdt
+
+    def reach_fn(self, state):
+        """Target set: attacker is within target_R of the origin."""
+        # l_R(x) ≤ 0 means "inside the reach target"
+        pos_a = torch.stack([state[..., 0], state[..., 2]], dim=-1)
+        return torch.norm(pos_a, dim=-1) - self.target_R
+
+    def avoid_fn(self, state):
+        """Avoid set: attacker is within capture_R of defender (interception)."""
+        # l_A(x) ≤ 0 means "inside the avoid set" (captured)
+        rel_pos = torch.stack([state[..., 0] - state[..., 4],
+                               state[..., 2] - state[..., 6]], dim=-1)
+        return torch.norm(rel_pos, dim=-1) - self.capture_R
+
+    def boundary_fn(self, state):
+        """BRAT terminal condition: max(l_R, -l_A)."""
+        return torch.max(self.reach_fn(state), -self.avoid_fn(state))
+
+    def hamiltonian(self, state, dvds):
+        # dvds has shape [..., 8] corresponding to ∂V/∂(state_i)
+        # Drift terms (gravity cancels in Hamiltonian since both have it on z-axis)
+        # Actually: only the velocity→position coupling and gravity are drift
+        ham = (dvds[..., 0] * state[..., 1] +    # ∂V/∂px_a · vx_a
+               dvds[..., 2] * state[..., 3] +    # ∂V/∂pz_a · vz_a
+               dvds[..., 4] * state[..., 5] +    # ∂V/∂px_d · vx_d
+               dvds[..., 6] * state[..., 7] +    # ∂V/∂pz_d · vz_d
+               dvds[..., 3] * self.Gz +           # ∂V/∂vz_a · g
+               dvds[..., 7] * self.Gz)            # ∂V/∂vz_d · g
+
+        # Attacker (controller) MINIMIZES V (set_mode='reach')
+        # H_control = min_u  dvds_u · u  =  -|dvds_u| · u_max
+        ham += -self.accel_max_a * (torch.abs(dvds[..., 1]) +   # |∂V/∂vx_a| · u_max_a
+                                    torch.abs(dvds[..., 3]))     # |∂V/∂vz_a| · u_max_a (control part)
+        # Wait — the gravity term on dvds[..., 3] is already in drift above.
+        # The control u_az enters as dvds[..., 3] * u_az, and we already accounted for 
+        # dvds[..., 3] * self.Gz. The optimal control on the z-axis just adds its own term.
+        # So the control Hamiltonian for the attacker is:
+        # min_{u_ax, u_az} [dvds[1]*u_ax + dvds[3]*u_az]
+        #   = -accel_max_a * (|dvds[1]| + |dvds[3]|)
+
+        # Defender (disturbance) MAXIMIZES V
+        # H_disturbance = max_d  dvds_d · d  =  +|dvds_d| · d_max
+        ham += self.accel_max_d * (torch.abs(dvds[..., 5]) +    # |∂V/∂vx_d| · u_max_d
+                                   torch.abs(dvds[..., 7]))      # |∂V/∂vz_d| · u_max_d
+
+        return ham
+
+    def optimal_control(self, state, dvds):
+        """Attacker minimizes V → bang-bang: u_i = -u_max · sign(∂V/∂v_i)"""
+        u_ax = -self.accel_max_a * torch.sign(dvds[..., 1])
+        u_az = -self.accel_max_a * torch.sign(dvds[..., 3])
+        return torch.stack([u_ax, u_az], dim=-1)
+
+    def optimal_disturbance(self, state, dvds):
+        """Defender maximizes V → bang-bang: d_i = +d_max · sign(∂V/∂v_i)"""
+        d_dx = self.accel_max_d * torch.sign(dvds[..., 5])
+        d_dz = self.accel_max_d * torch.sign(dvds[..., 7])
+        return torch.stack([d_dx, d_dz], dim=-1)
+
+    def plot_config(self):
+        return {
+            'state_slices': [0, 0, 0, 0, 0, 0, 0, 0],  # slice at origin
+            'state_labels': ['px_a', 'vx_a', 'pz_a', 'vz_a',
+                             'px_d', 'vx_d', 'pz_d', 'vz_d'],
+            'x_axis_idx': 0,   # px_a
+            'y_axis_idx': 2,   # pz_a
+            'z_axis_idx': 4,   # px_d (will be sliced at z_resolution points)
+        }
 
 class ParameterizedVertDrone2D(Dynamics):
     def __init__(self, gravity:float, input_multiplier_max:float, input_magnitude_max:float):

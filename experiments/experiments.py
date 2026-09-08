@@ -73,8 +73,15 @@ class Experiment(ABC):
                     values = self.dataset.dynamics.io_to_value(model_results['model_in'].detach(), model_results['model_out'].squeeze(dim=-1).detach())
                 
                 ax = fig.add_subplot(len(times), len(zs), (j+1) + i*len(zs))
-                ax.set_title('t = %0.2f, %s = %0.2f' % (times[i], plot_config['state_labels'][plot_config['z_axis_idx']], zs[j]))
-                s = ax.imshow(1*(values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T <= 0), cmap='bwr', origin='lower', extent=(-1., 1., -1., 1.))
+                # build title showing all fixed state values
+                title_parts = ['t = %0.2f' % times[i]]
+                for dim in range(len(plot_config['state_slices'])):
+                    if dim == plot_config['x_axis_idx'] or dim == plot_config['y_axis_idx']:
+                        continue  # these are the axes, not fixed
+                    val = zs[j] if dim == plot_config['z_axis_idx'] else plot_config['state_slices'][dim]
+                    title_parts.append('%s=%.1f' % (plot_config['state_labels'][dim], val))
+                ax.set_title(', '.join(title_parts), fontsize=7)
+                s = ax.imshow(1*(values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T <= 0), cmap='bwr', origin='lower', extent=(x_min, x_max, y_min, y_max))
                 fig.colorbar(s) 
         fig.savefig(save_path)
         if self.use_wandb:

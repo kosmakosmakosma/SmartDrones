@@ -5,8 +5,10 @@ import shutil
 import time
 import math
 import pickle
+import random
 import numpy as np
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import plotly.express as px
 import scipy.io as spio
@@ -40,49 +42,111 @@ class Experiment(ABC):
             model_path = os.path.join(self.experiment_dir, 'training', 'checkpoints', 'model_epoch_%04d.pth' % epoch)
             self.model.load_state_dict(torch.load(model_path)['model'])
 
+    @staticmethod
+    def _atomic_torch_save(value, path):
+        temporary_path = path + '.tmp'
+        torch.save(value, temporary_path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary_path, path)
+                return True
+            except PermissionError:
+                if attempt == 4:
+                    print('Warning: could not replace checkpoint %s; keeping the previous checkpoint.' % path)
+                    try:
+                        os.remove(temporary_path)
+                    except OSError:
+                        pass
+                    return False
+                time.sleep(0.5)
+
+    def _training_checkpoint(self, epoch, total_steps, optimizer, train_losses, last_CSL_epoch, new_weight):
+        return {
+            'epoch': epoch,
+            'total_steps': total_steps,
+            'model': self.model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'train_losses': train_losses,
+            'last_CSL_epoch': last_CSL_epoch,
+            'new_weight': new_weight,
+            'dataset': self.dataset.state_dict(),
+            'random_state': random.getstate(),
+            'numpy_random_state': np.random.get_state(),
+            'torch_random_state': torch.get_rng_state(),
+            'cuda_random_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
     def validate(self, device, epoch, save_path, x_resolution, y_resolution, z_resolution, time_resolution):
         was_training = self.model.training
         self.model.eval()
         self.model.requires_grad_(False)
 
         plot_config = self.dataset.dynamics.plot_config()
+        x_idx = plot_config['x_axis_idx']
+        y_idx = plot_config['y_axis_idx']
+        slice_idx = plot_config['z_axis_idx']
 
         state_test_range = self.dataset.dynamics.state_test_range()
-        x_min, x_max = state_test_range[plot_config['x_axis_idx']]
-        y_min, y_max = state_test_range[plot_config['y_axis_idx']]
-        z_min, z_max = state_test_range[plot_config['z_axis_idx']]
+        x_min, x_max = state_test_range[x_idx]
+        y_min, y_max = state_test_range[y_idx]
+        slice_min, slice_max = state_test_range[slice_idx]
 
         times = torch.linspace(0, self.dataset.tMax, time_resolution)
         xs = torch.linspace(x_min, x_max, x_resolution)
         ys = torch.linspace(y_min, y_max, y_resolution)
-        zs = torch.linspace(z_min, z_max, z_resolution)
+        slice_values = torch.linspace(slice_min, slice_max, z_resolution)
         xys = torch.cartesian_prod(xs, ys)
-        
-        fig = plt.figure(figsize=(5*len(times), 5*len(zs)))
+
+        panel_values = []
         for i in range(len(times)):
-            for j in range(len(zs)):
+            panel_row = []
+            for j in range(len(slice_values)):
                 coords = torch.zeros(x_resolution*y_resolution, self.dataset.dynamics.state_dim + 1)
                 coords[:, 0] = times[i]
                 coords[:, 1:] = torch.tensor(plot_config['state_slices'])
-                coords[:, 1 + plot_config['x_axis_idx']] = xys[:, 0]
-                coords[:, 1 + plot_config['y_axis_idx']] = xys[:, 1]
-                coords[:, 1 + plot_config['z_axis_idx']] = zs[j]
+                coords[:, 1 + x_idx] = xys[:, 0]
+                coords[:, 1 + y_idx] = xys[:, 1]
+                coords[:, 1 + slice_idx] = slice_values[j]
 
                 with torch.no_grad():
                     model_results = self.model({'coords': self.dataset.dynamics.coord_to_input(coords.to(device))})
                     values = self.dataset.dynamics.io_to_value(model_results['model_in'].detach(), model_results['model_out'].squeeze(dim=-1).detach())
-                
-                ax = fig.add_subplot(len(times), len(zs), (j+1) + i*len(zs))
-                # build title showing all fixed state values
-                title_parts = ['t = %0.2f' % times[i]]
-                for dim in range(len(plot_config['state_slices'])):
-                    if dim == plot_config['x_axis_idx'] or dim == plot_config['y_axis_idx']:
-                        continue  # these are the axes, not fixed
-                    val = zs[j] if dim == plot_config['z_axis_idx'] else plot_config['state_slices'][dim]
-                    title_parts.append('%s=%.1f' % (plot_config['state_labels'][dim], val))
-                ax.set_title(', '.join(title_parts), fontsize=7)
-                s = ax.imshow(1*(values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T <= 0), cmap='bwr', origin='lower', extent=(x_min, x_max, y_min, y_max))
-                fig.colorbar(s) 
+                panel_row.append(values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T)
+            panel_values.append(panel_row)
+
+        value_limit = max(np.percentile(np.abs(np.asarray(panel_values)), 99), 1e-8)
+        value_norm = matplotlib.colors.TwoSlopeNorm(vmin=-value_limit, vcenter=0.0, vmax=value_limit)
+        fig, axes = plt.subplots(
+            len(times), len(slice_values),
+            figsize=(3.2*len(slice_values), 3.0*len(times)),
+            sharex=True, sharey=True, squeeze=False, constrained_layout=True)
+
+        image = None
+        for i, time_value in enumerate(times):
+            for j, slice_value in enumerate(slice_values):
+                ax = axes[i, j]
+                values = panel_values[i][j]
+                image = ax.imshow(
+                    values, cmap='coolwarm_r', norm=value_norm, origin='lower',
+                    extent=(x_min, x_max, y_min, y_max), aspect='equal')
+                if values.min() <= 0 <= values.max():
+                    ax.contour(xs.numpy(), ys.numpy(), values, levels=[0], colors='black', linewidths=1.2)
+                if i == 0:
+                    ax.set_title('%s = %.2f' % (plot_config['state_labels'][slice_idx], slice_value))
+                if j == 0:
+                    ax.set_ylabel('t = %.2f\n%s' % (time_value, plot_config['state_labels'][y_idx]))
+                if i == len(times) - 1:
+                    ax.set_xlabel(plot_config['state_labels'][x_idx])
+
+        fixed_states = [
+            '%s=%.1f' % (plot_config['state_labels'][dim], value)
+            for dim, value in enumerate(plot_config['state_slices'])
+            if dim not in [x_idx, y_idx, slice_idx]
+        ]
+        fig.suptitle(
+            '%s value function (black: V=0)\nFixed: %s' %
+            (type(self.dataset.dynamics).__name__, ', '.join(fixed_states)))
+        fig.colorbar(image, ax=axes, shrink=0.9, label='V(t, x): red ≤ 0, blue > 0')
         fig.savefig(save_path)
         if self.use_wandb:
             wandb.log({
@@ -94,6 +158,41 @@ class Experiment(ABC):
         if was_training:
             self.model.train()
             self.model.requires_grad_(True)
+
+    def _update_learned_boundary_samples(self, device):
+        if self.dataset.learned_boundary_candidate_samples <= 0 or self.dataset.learned_boundary_keep_samples <= 0:
+            return
+
+        was_training = self.model.training
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+        num_candidates = self.dataset.learned_boundary_candidate_samples
+        keep_count = min(self.dataset.learned_boundary_keep_samples, num_candidates)
+        model_states = torch.zeros(num_candidates, self.dataset.dynamics.state_dim).uniform_(-1, 1)
+        times = self.dataset._sample_times(num_candidates)
+        model_coords = torch.cat((times, model_states), dim=1)
+        if self.dataset.dynamics.input_dim > self.dataset.dynamics.state_dim + 1:
+            model_coords = torch.cat((
+                model_coords,
+                torch.zeros(num_candidates, self.dataset.dynamics.input_dim - self.dataset.dynamics.state_dim - 1)), dim=1)
+
+        with torch.no_grad():
+            model_results = self.model({'coords': model_coords.to(device)})
+            values = self.dataset.dynamics.io_to_value(
+                model_results['model_in'], model_results['model_out'].squeeze(dim=-1))
+            boundary_indices = torch.topk(torch.abs(values), keep_count, largest=False).indices.detach().cpu()
+
+        self.dataset.add_learned_boundary_samples(model_coords[boundary_indices])
+        print('Updated learned-boundary replay buffer with %d samples (%d total)' % (
+            keep_count, len(self.dataset.learned_boundary_coords)))
+
+        if self.use_wandb:
+            wandb.log({'learned_boundary_buffer_size': len(self.dataset.learned_boundary_coords)})
+
+        if was_training:
+            self.model.train()
+            self.model.requires_grad_(True)
     
     def train(
             self, device, batch_size, epochs, lr, 
@@ -101,6 +200,7 @@ class Experiment(ABC):
             loss_fn, clip_grad, use_lbfgs, adjust_relative_grads, 
             val_x_resolution, val_y_resolution, val_z_resolution, val_time_resolution,
             use_CSL, CSL_lr, CSL_dt, epochs_til_CSL, num_CSL_samples, CSL_loss_frac_cutoff, max_CSL_epochs, CSL_loss_weight, CSL_batch_size,
+            resume=False, autosave_epochs=10, additional_epochs=0,
         ):
         was_eval = not self.model.training
         self.model.train()
@@ -128,15 +228,54 @@ class Experiment(ABC):
 
         writer = SummaryWriter(summaries_dir)
 
+        if autosave_epochs < 1:
+            raise ValueError('autosave_epochs must be at least 1')
+
+        start_epoch = 0
         total_steps = 0
+        new_weight = 1
+        train_losses = []
+        last_CSL_epoch = -1
+        resume_checkpoint_path = os.path.join(checkpoints_dir, 'resume_latest.pth')
 
-        if adjust_relative_grads:
-            new_weight = 1
+        if resume:
+            if not os.path.exists(resume_checkpoint_path):
+                raise RuntimeError('Cannot resume: %s does not exist' % resume_checkpoint_path)
+            checkpoint = torch.load(resume_checkpoint_path, map_location='cpu', weights_only=False)
+            self.model.load_state_dict(checkpoint['model'])
+            optim.load_state_dict(checkpoint['optimizer'])
+            for optimizer_state in optim.state.values():
+                for key, value in optimizer_state.items():
+                    if torch.is_tensor(value):
+                        optimizer_state[key] = value.to(device)
+            start_epoch = checkpoint['epoch']
+            total_steps = checkpoint.get('total_steps', start_epoch * len(train_dataloader))
+            train_losses = checkpoint.get('train_losses', [])
+            last_CSL_epoch = checkpoint.get('last_CSL_epoch', -1)
+            new_weight = checkpoint.get('new_weight', 1)
+            dataset_state = checkpoint.get('dataset', {})
+            self.dataset.load_state_dict(dataset_state)
+            random.setstate(checkpoint['random_state'])
+            np.random.set_state(checkpoint['numpy_random_state'])
+            torch.set_rng_state(checkpoint['torch_random_state'])
+            if torch.cuda.is_available() and checkpoint.get('cuda_random_state') is not None:
+                torch.cuda.set_rng_state_all(checkpoint['cuda_random_state'])
+            print('Resuming training from completed epoch %d' % start_epoch)
 
-        with tqdm(total=len(train_dataloader) * epochs) as pbar:
-            train_losses = []
-            last_CSL_epoch = -1
-            for epoch in range(0, epochs):
+        target_epochs = epochs + additional_epochs
+        if start_epoch > target_epochs:
+            raise RuntimeError(
+                'Checkpoint epoch %d is beyond requested target epoch %d' %
+                (start_epoch, target_epochs))
+        if additional_epochs:
+            print('Refining at the full horizon through epoch %d' % target_epochs)
+
+        with tqdm(total=len(train_dataloader) * target_epochs, initial=len(train_dataloader) * start_epoch) as pbar:
+            for epoch in range(start_epoch, target_epochs):
+                if (not self.dataset.pretrain and
+                        self.dataset.learned_boundary_fraction > 0 and
+                        not epoch % self.dataset.learned_boundary_update_epochs):
+                    self._update_learned_boundary_samples(device)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)
@@ -238,11 +377,6 @@ class Experiment(ABC):
 
                     train_losses.append(train_loss.item())
                     writer.add_scalar("total_train_loss", train_loss, total_steps)
-
-                    if not total_steps % steps_til_summary:
-                        torch.save(self.model.state_dict(),
-                                os.path.join(checkpoints_dir, 'model_current.pth'))
-                        # summary_fn(model, model_input, gt, model_output, writer, total_steps)
 
                     if not use_lbfgs:
                         optim.zero_grad()
@@ -455,19 +589,28 @@ class Experiment(ABC):
                         if CSL_val_loss < CSL_loss_frac_cutoff*CSL_initial_val_loss:
                             break
 
-                if not (epoch+1) % epochs_til_checkpoint:
-                    # Saving the optimizer state is important to produce consistent results
-                    checkpoint = { 
-                        'epoch': epoch+1,
-                        'model': self.model.state_dict(),
-                        'optimizer': optim.state_dict()}
-                    torch.save(checkpoint,
-                        os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % (epoch+1)))
-                    np.savetxt(os.path.join(checkpoints_dir, 'train_losses_epoch_%04d.txt' % (epoch+1)),
+                completed_epochs = epoch + 1
+                checkpoint = self._training_checkpoint(
+                    completed_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight)
+                if (completed_epochs == 1 or
+                        not completed_epochs % autosave_epochs or
+                        not completed_epochs % epochs_til_checkpoint):
+                    self._atomic_torch_save(checkpoint, resume_checkpoint_path)
+
+                if not completed_epochs % epochs_til_checkpoint:
+                    self._atomic_torch_save(checkpoint,
+                        os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % completed_epochs))
+                    np.savetxt(os.path.join(checkpoints_dir, 'train_losses_epoch_%04d.txt' % completed_epochs),
                         np.array(train_losses))
                     self.validate(
-                        device=device, epoch=epoch+1, save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot_epoch_%04d.png' % (epoch+1)),
+                        device=device, epoch=completed_epochs, save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot_epoch_%04d.png' % completed_epochs),
                         x_resolution = val_x_resolution, y_resolution = val_y_resolution, z_resolution=val_z_resolution, time_resolution=val_time_resolution)
+
+        final_checkpoint = self._training_checkpoint(
+            target_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight)
+        self._atomic_torch_save(final_checkpoint, resume_checkpoint_path)
+        self._atomic_torch_save(self.model.state_dict(), os.path.join(checkpoints_dir, 'model_final.pth'))
+        writer.close()
 
         if was_eval:
             self.model.eval()

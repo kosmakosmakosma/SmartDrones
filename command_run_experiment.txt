@@ -2,18 +2,29 @@ python run_experiment.py
   --mode train 
   --experiment_class DeepReach 
   --dynamics_class CrazyflieInterception 
-  --experiment_name crazyflie_2d_v1 
+  --experiment_name crazyflie_2d_no_grav_test2
   --minWith target 
   --target_R 0.25 
   --capture_R 0.2 
   --accel_max_a 5.0 
   --accel_max_d 7.0 
   --pretrain 
-  --tMax 1.5 
-  --num_epochs 5000
-  --numpoints 10000
+  --pretrain_iters 10000
+  --counter_end 85000
+  --num_epochs 110000
+  --numpoints 45000
+  --learned_boundary_fraction 0.5
+  --geometric_boundary_fraction 0.2
+  --learned_boundary_update_epochs 1000
+  --learned_boundary_candidate_samples 100000
+  --learned_boundary_keep_samples 10000
+  --learned_boundary_buffer_size 100000
+  --lr 2e-5
+  --tMax 1.0 
   --use_wandb 
   --wandb_project SmartDrones 
   --wandb_entity kosmakosmakosma-tu-delft
-  --wandb_group 2d_drones
-  --wandb_name test1
+  --wandb_group 2d_drones_no_grav
+  --wandb_name test2
+  --resume
+  --additional_epochs 60000

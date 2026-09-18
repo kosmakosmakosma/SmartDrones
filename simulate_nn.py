@@ -95,11 +95,11 @@ def nn_control(state_np, tau):
 
     Args:
         state_np: numpy array of shape (8,) — real-unit state
-        tau: float — backward time to query (use tMax for receding horizon)
+        tau: float — remaining horizon (backward time) to query
 
     Returns:
-        u: numpy array (2,) — attacker control [u_ax, u_az]
-        d: numpy array (2,) — defender control [d_dx, d_dz]
+        u: numpy array (2,) — attacker control [u_ax, u_ay]
+        d: numpy array (2,) — defender control [d_dx, d_dy]
         V: float — value function at this state
         dvds: numpy array (8,) — spatial gradients of V
     """
@@ -143,15 +143,15 @@ def nn_control(state_np, tau):
 # ──────────────────────────────────────────────────
 target_R = dynamics.target_R
 capture_R = dynamics.capture_R
+defender_exclusion_R = target_R + capture_R
 accel_max_a = dynamics.accel_max_a
 accel_max_d = dynamics.accel_max_d
-Gz = dynamics.Gz
 tMax = orig_opt.tMax  # training time horizon
 
 print(f"\nPhysical parameters:")
 print(f"  target_R = {target_R}, capture_R = {capture_R}")
+print(f"  defender_exclusion_R = {defender_exclusion_R}")
 print(f"  accel_max_a = {accel_max_a}, accel_max_d = {accel_max_d}")
-print(f"  Gz = {Gz}")
 
 # ──────────────────────────────────────────────────
 # Dynamics (same as CrazyflieInterception.dsdt)
@@ -162,12 +162,12 @@ def step_dynamics(state, u, d, dt):
         dsdt = np.zeros(8)
         dsdt[0] = s[1]              # dpx_a/dt = vx_a
         dsdt[1] = u[0]              # dvx_a/dt = u_ax
-        dsdt[2] = s[3]              # dpz_a/dt = vz_a
-        dsdt[3] = u[1] + Gz         # dvz_a/dt = u_az + g
+        dsdt[2] = s[3]              # dpy_a/dt = vy_a
+        dsdt[3] = u[1]              # dvy_a/dt = u_ay
         dsdt[4] = s[5]              # dpx_d/dt = vx_d
         dsdt[5] = d[0]              # dvx_d/dt = d_dx
-        dsdt[6] = s[7]              # dpz_d/dt = vz_d
-        dsdt[7] = d[1] + Gz         # dvz_d/dt = d_dz + g
+        dsdt[6] = s[7]              # dpy_d/dt = vy_d
+        dsdt[7] = d[1]              # dvy_d/dt = d_dy
         return dsdt
 
     k1 = f(state)
@@ -180,12 +180,12 @@ def step_dynamics(state, u, d, dt):
 # ──────────────────────────────────────────────────
 # Initial conditions
 # ──────────────────────────────────────────────────
-# state = [px_a, vx_a, pz_a, vz_a, px_d, vx_d, pz_d, vz_d]
+# state = [px_a, vx_a, py_a, vy_a, px_d, vx_d, py_d, vy_d]
 state0 = np.array([
-    1.5,  0.0,    # attacker: x=1.5m, vx=0
-    1.0,  0.0,    # attacker: z=1.0m, vz=0
-   -1.0,  0.0,    # defender: x=-1.0m, vx=0
-    0.5,  0.0,    # defender: z=0.5m, vz=0
+    -1.8,  0.0,    # attacker: x=1.5m, vx=0
+    0.0,  0.0,    # attacker: y=1.0m, vy=0
+   -0.8,  0.0,    # defender: x=-1.0m, vx=0
+    0.0,  0.0,    # defender: y=0.5m, vy=0
 ])
 
 # ──────────────────────────────────────────────────
@@ -212,15 +212,16 @@ outcome = "timeout"
 outcome_time = args.t_max_sim
 
 print(f"\nSimulating with dt={dt}, t_max={args.t_max_sim}")
-print(f"Querying V at tau={tMax} (receding horizon)")
+print(f"Querying V with countdown tau=max({tMax} - t, 0)")
 print(f"Initial V = {V0:.4f}")
 print()
 
 for i in range(n_steps):
     s = trajectory[i]
+    tau = max(tMax - times[i], 0.0)
 
     # get optimal control from neural network
-    u, d, V_val, dvds = nn_control(s, tMax)
+    u, d, V_val, dvds = nn_control(s, tau)
 
     controls_a[i] = u
     controls_d[i] = d
@@ -230,7 +231,8 @@ for i in range(n_steps):
     times[i + 1] = times[i] + dt
 
     # query V at new state
-    _, _, V_new, _ = nn_control(trajectory[i + 1], tMax)
+    tau_new = max(tMax - times[i + 1], 0.0)
+    _, _, V_new, _ = nn_control(trajectory[i + 1], tau_new)
     values[i + 1] = V_new
 
     # check termination
@@ -239,7 +241,17 @@ for i in range(n_steps):
 
     dist_to_target = np.linalg.norm(pos_a)
     dist_to_defender = np.linalg.norm(pos_a - pos_d)
+    defender_dist_to_target = np.linalg.norm(pos_d)
 
+    if defender_dist_to_target <= defender_exclusion_R:
+        outcome = "defender_entered_target"
+        outcome_time = times[i + 1]
+        trajectory = trajectory[:i + 2]
+        controls_a = controls_a[:i + 1]
+        controls_d = controls_d[:i + 1]
+        values = values[:i + 2]
+        times = times[:i + 2]
+        break
     if dist_to_defender <= capture_R:
         outcome = "captured"
         outcome_time = times[i + 1]
@@ -262,12 +274,28 @@ for i in range(n_steps):
     # progress update every 100 steps
     if (i + 1) % 100 == 0:
         print(f"  t={times[i+1]:.3f}s  V={V_new:.4f}  "
-              f"d_target={dist_to_target:.3f}  d_capture={dist_to_defender:.3f}")
+              f"d_target={dist_to_target:.3f}  d_capture={dist_to_defender:.3f}  "
+              f"d_defender_target={defender_dist_to_target:.3f}")
 
 print(f"\nOutcome: {outcome} at t = {outcome_time:.4f}s")
 print(f"Final attacker pos: ({trajectory[-1, 0]:.3f}, {trajectory[-1, 2]:.3f})")
 print(f"Final defender pos: ({trajectory[-1, 4]:.3f}, {trajectory[-1, 6]:.3f})")
 print(f"Final V = {values[-1]:.4f}")
+
+state_mean = dynamics.state_mean.cpu().numpy()
+state_var = dynamics.state_var.cpu().numpy()
+outside_training_domain = np.logical_or(
+    trajectory < state_mean - state_var,
+    trajectory > state_mean + state_var,
+)
+if np.any(outside_training_domain):
+    first_exit_step = np.flatnonzero(np.any(outside_training_domain, axis=1))[0]
+    exited_dimensions = np.flatnonzero(outside_training_domain[first_exit_step])
+    print(
+        "WARNING: rollout left the sampled training domain at "
+        f"t={times[first_exit_step]:.4f}s in state dimension(s) "
+        f"{exited_dimensions.tolist()}; subsequent V and controls are extrapolation."
+    )
 
 
 # ──────────────────────────────────────────────────
@@ -275,11 +303,11 @@ print(f"Final V = {values[-1]:.4f}")
 # ──────────────────────────────────────────────────
 fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-# --- Panel 1: 2D trajectory (x vs z) ---
+# --- Panel 1: 2D trajectory (x vs y) ---
 ax = axes[0, 0]
-ax.set_title("Trajectories in (x, z) plane")
+ax.set_title("Trajectories in (x, y) plane")
 ax.set_xlabel("x [m]")
-ax.set_ylabel("z [m]")
+ax.set_ylabel("y [m]")
 ax.set_aspect("equal")
 
 t_norm = times / times[-1]
@@ -303,6 +331,8 @@ ax.plot(*points_d[-1], "r^", ms=10, label="Defender end")
 
 ax.add_patch(Circle((0, 0), target_R, fill=False, color="green",
                      lw=2, ls="--", label=f"Target (r={target_R}m)"))
+ax.add_patch(Circle((0, 0), defender_exclusion_R, fill=False, color="purple",
+                     lw=2, ls="-.", label=f"Defender exclusion (r={defender_exclusion_R}m)"))
 ax.add_patch(Circle(points_a[-1], capture_R, fill=False, color="orange",
                      lw=2, ls=":", label=f"Capture (r={capture_R}m)"))
 
@@ -320,17 +350,20 @@ ax.set_ylabel("Distance [m]")
 dist_target = np.sqrt(trajectory[:, 0]**2 + trajectory[:, 2]**2)
 dist_capture = np.sqrt((trajectory[:, 0] - trajectory[:, 4])**2 +
                         (trajectory[:, 2] - trajectory[:, 6])**2)
+dist_defender_target = np.sqrt(trajectory[:, 4]**2 + trajectory[:, 6]**2)
 
 ax.plot(times, dist_target, "b-", lw=2, label="Attacker → origin")
 ax.plot(times, dist_capture, "r-", lw=2, label="Attacker → defender")
+ax.plot(times, dist_defender_target, color="purple", lw=2, label="Defender → origin")
 ax.axhline(target_R, color="green", ls="--", alpha=0.7, label=f"Target radius")
 ax.axhline(capture_R, color="orange", ls=":", alpha=0.7, label=f"Capture radius")
+ax.axhline(defender_exclusion_R, color="purple", ls="-.", alpha=0.7, label="Defender exclusion")
 ax.legend(fontsize=8)
 ax.grid(True, alpha=0.3)
 
 # --- Panel 3: value function ---
 ax = axes[0, 2]
-ax.set_title("Value function V(tMax, x(t))")
+ax.set_title("Value function V(tMax - t, x(t))")
 ax.set_xlabel("Time [s]")
 ax.set_ylabel("V")
 
@@ -349,7 +382,7 @@ ax.set_ylabel("Acceleration [m/s²]")
 
 t_ctrl = times[:-1]
 ax.step(t_ctrl, controls_a[:, 0], "b-", lw=1.5, label="u_ax", where="post")
-ax.step(t_ctrl, controls_a[:, 1], "c-", lw=1.5, label="u_az", where="post")
+ax.step(t_ctrl, controls_a[:, 1], "c-", lw=1.5, label="u_ay", where="post")
 ax.axhline(accel_max_a, color="gray", ls=":", alpha=0.5)
 ax.axhline(-accel_max_a, color="gray", ls=":", alpha=0.5)
 ax.set_ylim(-accel_max_a * 1.3, accel_max_a * 1.3)
@@ -363,7 +396,7 @@ ax.set_xlabel("Time [s]")
 ax.set_ylabel("Acceleration [m/s²]")
 
 ax.step(t_ctrl, controls_d[:, 0], "r-", lw=1.5, label="d_dx", where="post")
-ax.step(t_ctrl, controls_d[:, 1], "m-", lw=1.5, label="d_dz", where="post")
+ax.step(t_ctrl, controls_d[:, 1], "m-", lw=1.5, label="d_dy", where="post")
 ax.axhline(accel_max_d, color="gray", ls=":", alpha=0.5)
 ax.axhline(-accel_max_d, color="gray", ls=":", alpha=0.5)
 ax.set_ylim(-accel_max_d * 1.3, accel_max_d * 1.3)
@@ -377,9 +410,9 @@ ax.set_xlabel("Time [s]")
 ax.set_ylabel("Velocity [m/s]")
 
 ax.plot(times, trajectory[:, 1], "b-", lw=1.5, label="vx_a")
-ax.plot(times, trajectory[:, 3], "b--", lw=1.5, label="vz_a")
+ax.plot(times, trajectory[:, 3], "b--", lw=1.5, label="vy_a")
 ax.plot(times, trajectory[:, 5], "r-", lw=1.5, label="vx_d")
-ax.plot(times, trajectory[:, 7], "r--", lw=1.5, label="vz_d")
+ax.plot(times, trajectory[:, 7], "r--", lw=1.5, label="vy_d")
 ax.legend(fontsize=8)
 ax.grid(True, alpha=0.3)
 

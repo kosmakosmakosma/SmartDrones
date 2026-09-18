@@ -5,7 +5,7 @@ def init_brt_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
     def brt_hjivi_loss(state, value, dvdt, dvds, boundary_value, dirichlet_mask, output):
         if torch.all(dirichlet_mask):
             # pretraining loss
-            diff_constraint_hom = torch.Tensor([0])
+            diff_constraint_hom = value.new_zeros(())
         else:
             ham = dynamics.hamiltonian(state, dvds)
             if minWith == 'zero':
@@ -21,17 +21,17 @@ def init_brt_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
                 # pretraining
                 dirichlet = output.squeeze(dim=-1)[dirichlet_mask]-0.0
             else:
-                return {'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
+                return {'diff_constraint_hom': torch.abs(diff_constraint_hom).mean()}
         
-        return {'dirichlet': torch.abs(dirichlet).sum() / dirichlet_loss_divisor,
-                'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
+        return {'dirichlet': torch.abs(dirichlet).mean() / dirichlet_loss_divisor,
+                'diff_constraint_hom': torch.abs(diff_constraint_hom).mean()}
 
     return brt_hjivi_loss
 def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
     def brat_hjivi_loss(state, value, dvdt, dvds, boundary_value, reach_value, avoid_value, dirichlet_mask, output):
         if torch.all(dirichlet_mask):
             # pretraining loss
-            diff_constraint_hom = torch.Tensor([0])
+            diff_constraint_hom = value.new_zeros(())
         else:
             ham = dynamics.hamiltonian(state, dvds)
             if minWith == 'zero':
@@ -47,7 +47,7 @@ def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
             if torch.all(dirichlet_mask):
                 dirichlet = output.squeeze(dim=-1)[dirichlet_mask]-0.0
             else:
-                return {'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
-        return {'dirichlet': torch.abs(dirichlet).sum() / dirichlet_loss_divisor,
-                'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
+                return {'diff_constraint_hom': torch.abs(diff_constraint_hom).mean()}
+        return {'dirichlet': torch.abs(dirichlet).mean() / dirichlet_loss_divisor,
+                'diff_constraint_hom': torch.abs(diff_constraint_hom).mean()}
     return brat_hjivi_loss

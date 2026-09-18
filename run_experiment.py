@@ -21,6 +21,8 @@ p.add_argument('--mode', type=str, required=True, choices=['all', 'train', 'test
 p.add_argument('--experiments_dir', type=str, default='./runs', help='Where to save the experiment subdirectory.')
 p.add_argument('--experiment_name', type=str, required=True, help='Name of the experient subdirectory.')
 p.add_argument('--use_wandb', default=False, action='store_true', help='use wandb for logging')
+p.add_argument('--resume', default=False, action='store_true', help='Resume training from the latest automatic checkpoint.')
+p.add_argument('--additional_epochs', type=int, default=0, help='Extra full-horizon epochs to run after the original training target (requires --resume).')
 
 use_wandb = p.parse_known_args()[0].use_wandb
 if use_wandb:
@@ -54,6 +56,12 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--counter_end', type=int, default=-1, required=False, help='Defines the linear step for curriculum training starting from the initial time')
     p.add_argument('--num_src_samples', type=int, default=1000, required=False, help='Number of source samples (initial-time samples) at each time step')
     p.add_argument('--num_target_samples', type=int, default=0, required=False, help='Number of samples inside the target set')
+    p.add_argument('--learned_boundary_fraction', type=float, default=0.5, required=False, help='Fraction of each post-pretrain batch sampled near the current learned V=0 boundary')
+    p.add_argument('--geometric_boundary_fraction', type=float, default=0.2, required=False, help='Fraction of each post-pretrain batch sampled near target and exclusion geometry')
+    p.add_argument('--learned_boundary_update_epochs', type=int, default=1000, required=False, help='Epochs between learned-boundary replay refreshes')
+    p.add_argument('--learned_boundary_candidate_samples', type=int, default=100000, required=False, help='Candidate states evaluated during each learned-boundary refresh')
+    p.add_argument('--learned_boundary_keep_samples', type=int, default=10000, required=False, help='Best near-boundary candidates added to replay at each refresh')
+    p.add_argument('--learned_boundary_buffer_size', type=int, default=100000, required=False, help='Maximum number of learned-boundary samples retained')
 
     # model options
     p.add_argument('--model', type=str, default='sine', required=False, choices=['sine', 'tanh', 'sigmoid', 'relu'], help='Type of model to evaluate, default is sine.')
@@ -65,8 +73,9 @@ if (mode == 'all') or (mode == 'train'):
     # training options
     p.add_argument('--epochs_til_ckpt', type=int, default=1000, help='Time interval in seconds until checkpoint is saved.')
     p.add_argument('--steps_til_summary', type=int, default=100, help='Time interval in seconds until tensorboard summary is saved.')
+    p.add_argument('--autosave_epochs', type=int, default=10, help='Save resumable training state every N completed epochs.')
     p.add_argument('--batch_size', type=int, default=1, help='Batch size used during training (irrelevant, since len(dataset) == 1).')
-    p.add_argument('--lr', type=float, default=2e-5, help='learning rate. default=2e-5')
+    p.add_argument('--lr', type=float, default=1e-4, help='learning rate. default=1e-4')
     p.add_argument('--num_epochs', type=int, default=100000, help='Number of epochs to train for.')
     p.add_argument('--clip_grad', default=0.0, type=float, help='Clip gradient.')
     p.add_argument('--use_lbfgs', default=False, type=bool, help='use L-BFGS.')
@@ -115,30 +124,51 @@ if (mode == 'all') or (mode == 'test'):
 
 opt = p.parse_args()
 
-# start wandb
-if use_wandb:
-    wandb.init(
-        project = opt.wandb_project,
-        entity = opt.wandb_entity,
-        group = opt.wandb_group,
-        name = opt.wandb_name,
-    )
-    wandb.config.update(opt)
+if opt.additional_epochs < 0:
+    p.error('--additional_epochs must be non-negative')
+if opt.additional_epochs and not opt.resume:
+    p.error('--additional_epochs requires --resume')
+if hasattr(opt, 'learned_boundary_fraction') and opt.learned_boundary_fraction + opt.geometric_boundary_fraction > 1.0:
+    p.error('--learned_boundary_fraction plus --geometric_boundary_fraction must be at most 1.0')
 
 experiment_dir = os.path.join(opt.experiments_dir, opt.experiment_name)
 if (mode == 'all') or (mode == 'train'):
-    # create experiment dir
-    if os.path.exists(experiment_dir):
+    if opt.resume:
+        if not os.path.exists(experiment_dir):
+            raise RuntimeError('Cannot resume: experiment directory not found!')
+    elif os.path.exists(experiment_dir):
         overwrite = input("The experiment directory %s already exists. Overwrite? (y/n)"%experiment_dir)
         if not (overwrite == 'y'):
             print('Exiting.')
             quit()
-        shutil.rmtree(experiment_dir)     
-    os.makedirs(experiment_dir)
+        shutil.rmtree(experiment_dir)
+        os.makedirs(experiment_dir)
+    else:
+        os.makedirs(experiment_dir)
 elif mode == 'test':
     # confirm that experiment dir already exists
     if not os.path.exists(experiment_dir):
         raise RuntimeError('Cannot run test mode: experiment directory not found!')
+
+if use_wandb:
+    wandb_id_path = os.path.join(experiment_dir, 'wandb_run_id.txt')
+    wandb_run_id = None
+    if opt.resume and os.path.exists(wandb_id_path):
+        with open(wandb_id_path, 'r') as wandb_id_file:
+            wandb_run_id = wandb_id_file.read().strip()
+    wandb.init(
+        project=opt.wandb_project,
+        entity=opt.wandb_entity,
+        group=opt.wandb_group,
+        name=opt.wandb_name,
+        id=wandb_run_id,
+        resume='must' if wandb_run_id else None,
+    )
+    if not wandb_run_id:
+        with open(wandb_id_path, 'w') as wandb_id_file:
+            wandb_id_file.write(wandb.run.id)
+    if not opt.resume:
+        wandb.config.update(opt)
 
 current_time = datetime.now()
 # log current config
@@ -146,7 +176,7 @@ with open(os.path.join(experiment_dir, 'config_%s.txt' % current_time.strftime('
     for arg, val in vars(opt).items():
         f.write(arg + ' = ' + str(val) + '\n')
 
-if (mode == 'all') or (mode == 'train'):
+if ((mode == 'all') or (mode == 'train')) and not opt.resume:
     # set counter_end appropriately if needed
     if opt.counter_end == -1:
         opt.counter_end = opt.num_epochs
@@ -172,7 +202,13 @@ dataset = dataio.ReachabilityDataset(
     pretrain=orig_opt.pretrain, pretrain_iters=orig_opt.pretrain_iters, 
     tMin=orig_opt.tMin, tMax=orig_opt.tMax, 
     counter_start=orig_opt.counter_start, counter_end=orig_opt.counter_end, 
-    num_src_samples=orig_opt.num_src_samples, num_target_samples=orig_opt.num_target_samples)
+    num_src_samples=orig_opt.num_src_samples, num_target_samples=orig_opt.num_target_samples,
+    learned_boundary_fraction=getattr(opt, 'learned_boundary_fraction', getattr(orig_opt, 'learned_boundary_fraction', 0.5)),
+    geometric_boundary_fraction=getattr(opt, 'geometric_boundary_fraction', getattr(orig_opt, 'geometric_boundary_fraction', 0.2)),
+    learned_boundary_update_epochs=getattr(opt, 'learned_boundary_update_epochs', getattr(orig_opt, 'learned_boundary_update_epochs', 1000)),
+    learned_boundary_candidate_samples=getattr(opt, 'learned_boundary_candidate_samples', getattr(orig_opt, 'learned_boundary_candidate_samples', 100000)),
+    learned_boundary_keep_samples=getattr(opt, 'learned_boundary_keep_samples', getattr(orig_opt, 'learned_boundary_keep_samples', 10000)),
+    learned_boundary_buffer_size=getattr(opt, 'learned_boundary_buffer_size', getattr(orig_opt, 'learned_boundary_buffer_size', 100000)))
 
 model = modules.SingleBVPNet(in_features=dynamics.input_dim, out_features=1, type=orig_opt.model, mode=orig_opt.model_mode,
                              final_layer_factor=1., hidden_features=orig_opt.num_nl, num_hidden_layers=orig_opt.num_hl)
@@ -194,7 +230,8 @@ if (mode == 'all') or (mode == 'train'):
         steps_til_summary=orig_opt.steps_til_summary, epochs_til_checkpoint=orig_opt.epochs_til_ckpt, 
         loss_fn=loss_fn, clip_grad=orig_opt.clip_grad, use_lbfgs=orig_opt.use_lbfgs, adjust_relative_grads=orig_opt.adj_rel_grads,
         val_x_resolution=orig_opt.val_x_resolution, val_y_resolution=orig_opt.val_y_resolution, val_z_resolution=orig_opt.val_z_resolution, val_time_resolution=orig_opt.val_time_resolution,
-        use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size)
+        use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size,
+        resume=opt.resume, autosave_epochs=opt.autosave_epochs, additional_epochs=opt.additional_epochs)
 
 if (mode == 'all') or (mode == 'test'):
     experiment.test(

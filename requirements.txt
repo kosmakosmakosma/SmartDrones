@@ -53,5 +53,5 @@ tqdm==4.66.2
 typing_extensions==4.8.0
 tzdata==2024.1
 urllib3==2.2.1
-wandb==0.16.3
+wandb==0.30.0
 Werkzeug==3.0.1

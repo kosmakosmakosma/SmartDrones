@@ -61,6 +61,21 @@ We highly recommend users use the `--use_wandb` flag to log training progress to
 
 Throughout training, the training loss curves, value function plots, and model checkpoints are saved locally to `runs/experiment_name/training/summaries` and `runs/experiment_name/training/checkpoints` (and to WandB, if specified).
 
+### Resuming Interrupted Training
+Training writes an atomic, full-state checkpoint to `runs/experiment_name/training/checkpoints/resume_latest.pth` after the first epoch and every 10 epochs by default. It includes the model, optimizer, curriculum and pretraining counters, loss history, and random-number generator states.
+
+To continue an interrupted run, rerun its original command with `--resume`. The existing experiment directory is preserved and training continues from the latest completed autosave:
+```
+python run_experiment.py <original arguments> --resume
+```
+Use `--autosave_epochs 1` to checkpoint after every epoch, or a larger value to reduce disk writes.
+
+After the original training target is complete, add full-horizon refinement epochs with:
+```
+python run_experiment.py <original arguments> --resume --additional_epochs 30000
+```
+The target remains the original `num_epochs` plus `additional_epochs`, so rerunning the same command after another interruption does not add the refinement epochs twice.
+
 ## Defining a Custom System
 Systems are defined in `dynamics/dynamics.py` and inherit from the abstract `Dynamics` class. At a minimum, users must define:
 * `__init(self, ...)__`, which must call `super().__init__(loss_type, set_mode, state_dim, ...)`

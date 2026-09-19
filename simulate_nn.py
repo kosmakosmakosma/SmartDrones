@@ -21,6 +21,15 @@ import inspect
 
 from dynamics import dynamics as dynamics_module
 from utils import modules
+from controllers.bang_bang import NeuralBangBangController
+from controllers.mpc import (
+    MPCConfig,
+    integrate_step,
+    optimize_control_sequence,
+    optimize_disturbance_sequence,
+    optimize_joint_sequences,
+    shift_control_sequence,
+)
 
 
 # ──────────────────────────────────────────────────
@@ -32,8 +41,29 @@ parser.add_argument('--experiment_name', type=str, required=True)
 parser.add_argument('--checkpoint', type=int, default=-1,
                     help='-1 for model_final.pth, else epoch number')
 parser.add_argument('--device', type=str, default='cuda:0')
-parser.add_argument('--dt', type=float, default=0.002, help='simulation timestep (s)')
+parser.add_argument('--dt', type=float, default=0.02, help='simulation timestep (s)')
 parser.add_argument('--t_max_sim', type=float, default=1.0, help='max simulation time (s)')
+parser.add_argument(
+    '--controller', type=str, default='bang_bang',
+    choices=['bang_bang', 'mpc', 'attacker_mpc', 'defender_mpc', 'both_mpc'],
+    help="'mpc' is an alias for attacker_mpc; 'both_mpc' uses alternating best responses",
+)
+parser.add_argument('--mpc_horizon_steps', type=int, default=50)
+parser.add_argument('--mpc_control_hold_steps', type=int, default=10,
+                    help='Number of rollout steps sharing each sampled control perturbation')
+parser.add_argument('--mpc_num_samples', type=int, default=128)
+parser.add_argument('--mpc_iterations', type=int, default=5)
+parser.add_argument('--mpc_noise_fraction', type=float, default=0.25,
+                    help='Gaussian std as a fraction of each optimized player max control')
+parser.add_argument('--mpc_noise_std', type=float, default=None,
+                    help='Absolute Gaussian std; overrides --mpc_noise_fraction')
+parser.add_argument('--mpc_defender_noise_fraction', type=float, default=None,
+                    help='Optional defender-specific noise fraction; defaults to --mpc_noise_fraction')
+parser.add_argument('--mpc_defender_noise_std', type=float, default=None,
+                    help='Absolute defender Gaussian std; overrides defender noise fraction')
+parser.add_argument('--mpc_integrator', type=str, default='euler', choices=['euler', 'rk4'])
+parser.add_argument('--mpc_seed', type=int, default=None)
+parser.add_argument('--mpc_candidate_chunk_size', type=int, default=None)
 args = parser.parse_args()
 
 experiment_dir = os.path.join(args.experiments_dir, args.experiment_name)
@@ -86,59 +116,6 @@ print(f"tMax (training horizon): {orig_opt.tMax}")
 print(f"Architecture: {orig_opt.num_hl} hidden layers, {orig_opt.num_nl} neurons, {orig_opt.model} activation")
 
 # ──────────────────────────────────────────────────
-# Neural network control law
-# ──────────────────────────────────────────────────
-def nn_control(state_np, tau):
-    """
-    Query the trained value function at (tau, state) and compute
-    the optimal bang-bang control from the spatial gradients.
-
-    Args:
-        state_np: numpy array of shape (8,) — real-unit state
-        tau: float — remaining horizon (backward time) to query
-
-    Returns:
-        u: numpy array (2,) — attacker control [u_ax, u_ay]
-        d: numpy array (2,) — defender control [d_dx, d_dy]
-        V: float — value function at this state
-        dvds: numpy array (8,) — spatial gradients of V
-    """
-    # build real-unit coordinate: [tau, state_0, ..., state_7]
-    coord = torch.zeros(1, 1 + dynamics.state_dim)
-    coord[0, 0] = tau
-    coord[0, 1:] = torch.tensor(state_np, dtype=torch.float32)
-
-    # convert to model input (normalized)
-    model_input = dynamics.coord_to_input(coord).to(args.device)
-    model_input.requires_grad_(True)
-
-    # forward pass
-    model_results = model({'coords': model_input})
-    model_out = model_results['model_out'].squeeze(dim=-1)
-    model_in = model_results['model_in']
-
-    # compute value and gradients in real units
-    V = dynamics.io_to_value(model_in, model_out)
-    dv = dynamics.io_to_dv(model_in, model_out)
-
-    # dv has shape (1, 9): [dvdt, dvds_0, ..., dvds_7]
-    dvds = dv[0, 1:]  # spatial gradients only
-
-    # optimal control from dynamics class
-    state_tensor = torch.tensor(state_np, dtype=torch.float32).unsqueeze(0).to(args.device)
-    u_tensor = dynamics.optimal_control(state_tensor, dvds.unsqueeze(0))
-    d_tensor = dynamics.optimal_disturbance(state_tensor, dvds.unsqueeze(0))
-
-    # convert to numpy
-    u = u_tensor[0].detach().cpu().numpy()
-    d = d_tensor[0].detach().cpu().numpy()
-    V_val = V[0].detach().cpu().item()
-    dvds_np = dvds.detach().cpu().numpy()
-
-    return u, d, V_val, dvds_np
-
-
-# ──────────────────────────────────────────────────
 # Physical parameters (read from dynamics)
 # ──────────────────────────────────────────────────
 target_R = dynamics.target_R
@@ -154,27 +131,118 @@ print(f"  defender_exclusion_R = {defender_exclusion_R}")
 print(f"  accel_max_a = {accel_max_a}, accel_max_d = {accel_max_d}")
 
 # ──────────────────────────────────────────────────
-# Dynamics (same as CrazyflieInterception.dsdt)
+# Controllers (dynamics/integration live in `dynamics`; control policy lives here)
 # ──────────────────────────────────────────────────
-def step_dynamics(state, u, d, dt):
-    """RK4 step for double integrator dynamics."""
-    def f(s):
-        dsdt = np.zeros(8)
-        dsdt[0] = s[1]              # dpx_a/dt = vx_a
-        dsdt[1] = u[0]              # dvx_a/dt = u_ax
-        dsdt[2] = s[3]              # dpy_a/dt = vy_a
-        dsdt[3] = u[1]              # dvy_a/dt = u_ay
-        dsdt[4] = s[5]              # dpx_d/dt = vx_d
-        dsdt[5] = d[0]              # dvx_d/dt = d_dx
-        dsdt[6] = s[7]              # dpy_d/dt = vy_d
-        dsdt[7] = d[1]              # dvy_d/dt = d_dy
-        return dsdt
+device = torch.device(args.device)
+dt = args.dt
+responder = NeuralBangBangController(model=model, dynamics=dynamics, device=device)
 
-    k1 = f(state)
-    k2 = f(state + 0.5 * dt * k1)
-    k3 = f(state + 0.5 * dt * k2)
-    k4 = f(state + dt * k3)
-    return state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+attacker_uses_mpc = args.controller in ('mpc', 'attacker_mpc', 'both_mpc')
+defender_uses_mpc = args.controller in ('defender_mpc', 'both_mpc')
+attacker_mpc_config = None
+defender_mpc_config = None
+mpc_generator = None
+nominal_attacker_controls = None
+nominal_defender_controls = None
+
+
+def make_mpc_config(control_bound, action_dim, noise_fraction, noise_std):
+    mpc_noise_std = noise_std if noise_std is not None else noise_fraction * control_bound
+    config = MPCConfig(
+        dt=dt,
+        horizon_steps=args.mpc_horizon_steps,
+        num_samples=args.mpc_num_samples,
+        num_iterations=args.mpc_iterations,
+        noise_std=mpc_noise_std,
+        control_lower=torch.full((action_dim,), -control_bound),
+        control_upper=torch.full((action_dim,), control_bound),
+        integration_method=args.mpc_integrator,
+        candidate_chunk_size=args.mpc_candidate_chunk_size,
+        control_hold_steps=args.mpc_control_hold_steps,
+    )
+    return config, mpc_noise_std
+
+
+if attacker_uses_mpc:
+    attacker_mpc_config, noise_std = make_mpc_config(
+        accel_max_a, dynamics.control_dim, args.mpc_noise_fraction, args.mpc_noise_std)
+    print(f"  Attacker MPC noise std = {noise_std:.3f} "
+          f"({noise_std / accel_max_a:.1%} of attacker max control)")
+if defender_uses_mpc:
+    defender_noise_fraction = (args.mpc_defender_noise_fraction
+                               if args.mpc_defender_noise_fraction is not None
+                               else args.mpc_noise_fraction)
+    defender_noise_std = (args.mpc_defender_noise_std
+                          if args.mpc_defender_noise_std is not None else args.mpc_noise_std)
+    defender_mpc_config, noise_std = make_mpc_config(
+        accel_max_d, dynamics.disturbance_dim,
+        defender_noise_fraction, defender_noise_std)
+    print(f"  Defender MPC noise std = {noise_std:.3f} "
+          f"({noise_std / accel_max_d:.1%} of defender max control)")
+if (attacker_uses_mpc or defender_uses_mpc) and args.mpc_seed is not None:
+    mpc_generator = torch.Generator(device=device)
+    mpc_generator.manual_seed(args.mpc_seed)
+
+
+def query_value(state_np, tau):
+    state_tensor = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
+    query = responder.query(state_tensor, torch.tensor([tau], dtype=torch.float32, device=device))
+    return query.values[0].detach().cpu().item()
+
+
+def query_controls(state_np, tau):
+    """Attacker + defender controls and value at (state, time-to-go tau); real units, numpy in/out."""
+    global nominal_attacker_controls, nominal_defender_controls
+    state_tensor = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
+    time_tensor = torch.tensor([tau], dtype=torch.float32, device=device)
+
+    if args.controller == 'bang_bang':
+        query = responder.query(state_tensor, time_tensor)
+        u = query.controls[0].detach().cpu().numpy()
+        d = query.disturbances[0].detach().cpu().numpy()
+        V_val = query.values[0].detach().cpu().item()
+        return u, d, V_val
+
+    if ((attacker_uses_mpc and nominal_attacker_controls is None)
+            or (defender_uses_mpc and nominal_defender_controls is None)):
+        if attacker_uses_mpc and nominal_attacker_controls is None:
+            nominal_attacker_controls = torch.zeros(
+                1, args.mpc_horizon_steps, dynamics.control_dim,
+                dtype=state_tensor.dtype, device=device,
+            )
+        if defender_uses_mpc and nominal_defender_controls is None:
+            nominal_defender_controls = torch.zeros(
+                1, args.mpc_horizon_steps, dynamics.disturbance_dim,
+                dtype=state_tensor.dtype, device=device,
+            )
+
+    if attacker_uses_mpc and defender_uses_mpc:
+        result = optimize_joint_sequences(
+            state_tensor, time_tensor, nominal_attacker_controls, nominal_defender_controls,
+            responder, dynamics, attacker_mpc_config, defender_mpc_config,
+            generator=mpc_generator, use_network_terminal_value=True,
+        )
+    elif attacker_uses_mpc:
+        result = optimize_control_sequence(
+            state_tensor, time_tensor, nominal_attacker_controls,
+            responder, dynamics, attacker_mpc_config,
+            generator=mpc_generator, use_network_terminal_value=True,
+        )
+    else:
+        result = optimize_disturbance_sequence(
+            state_tensor, time_tensor, nominal_defender_controls,
+            responder, dynamics, defender_mpc_config,
+            generator=mpc_generator, use_network_terminal_value=True,
+        )
+
+    u = result.controls[0, 0].detach().cpu().numpy()
+    d = result.defender_controls[0, 0].detach().cpu().numpy()
+    V_val = result.network_values[0, 0].detach().cpu().item()
+    if attacker_uses_mpc:
+        nominal_attacker_controls = shift_control_sequence(result.controls.detach())
+    if defender_uses_mpc:
+        nominal_defender_controls = shift_control_sequence(result.defender_controls.detach())
+    return u, d, V_val
 
 
 # ──────────────────────────────────────────────────
@@ -182,16 +250,15 @@ def step_dynamics(state, u, d, dt):
 # ──────────────────────────────────────────────────
 # state = [px_a, vx_a, py_a, vy_a, px_d, vx_d, py_d, vy_d]
 state0 = np.array([
-    -1.8,  0.0,    # attacker: x=1.5m, vx=0
-    0.0,  0.0,    # attacker: y=1.0m, vy=0
-   -0.8,  0.0,    # defender: x=-1.0m, vx=0
-    0.0,  0.0,    # defender: y=0.5m, vy=0
+    1.5,  0.0,    # attacker: x=1.5m, vx=0
+    -0.2,  0.0,    # attacker: y=1.0m, vy=0
+    0.0,  0.1,    # defender: x=-1.0m, vx=0
+    0.7,  0.0,    # defender: y=0.5m, vy=0
 ])
 
 # ──────────────────────────────────────────────────
 # Simulate
 # ──────────────────────────────────────────────────
-dt = args.dt
 n_steps = int(args.t_max_sim / dt)
 
 trajectory = np.zeros((n_steps + 1, 8))
@@ -203,15 +270,13 @@ times = np.zeros(n_steps + 1)
 trajectory[0] = state0
 
 # query V at initial state
-with torch.no_grad():
-    pass  # gradients needed inside nn_control
-_, _, V0, _ = nn_control(state0, tMax)
+V0 = query_value(state0, tMax)
 values[0] = V0
 
 outcome = "timeout"
 outcome_time = args.t_max_sim
 
-print(f"\nSimulating with dt={dt}, t_max={args.t_max_sim}")
+print(f"\nSimulating with dt={dt}, t_max={args.t_max_sim}, controller={args.controller}")
 print(f"Querying V with countdown tau=max({tMax} - t, 0)")
 print(f"Initial V = {V0:.4f}")
 print()
@@ -220,19 +285,23 @@ for i in range(n_steps):
     s = trajectory[i]
     tau = max(tMax - times[i], 0.0)
 
-    # get optimal control from neural network
-    u, d, V_val, dvds = nn_control(s, tau)
+    # get attacker/defender controls (bang-bang or receding-horizon MPC)
+    u, d, V_val = query_controls(s, tau)
 
     controls_a[i] = u
     controls_d[i] = d
 
-    # step dynamics
-    trajectory[i + 1] = step_dynamics(s, u, d, dt)
+    # step dynamics (matches CrazyflieInterception.dsdt via RK4)
+    state_tensor = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+    control_tensor = torch.tensor(u, dtype=torch.float32, device=device).unsqueeze(0)
+    disturbance_tensor = torch.tensor(d, dtype=torch.float32, device=device).unsqueeze(0)
+    next_state_tensor = integrate_step(dynamics, state_tensor, control_tensor, disturbance_tensor, dt, 'rk4')
+    trajectory[i + 1] = next_state_tensor[0].detach().cpu().numpy()
     times[i + 1] = times[i] + dt
 
-    # query V at new state
+    # Querying the value must not trigger a second MPC optimization.
     tau_new = max(tMax - times[i + 1], 0.0)
-    _, _, V_new, _ = nn_control(trajectory[i + 1], tau_new)
+    V_new = query_value(trajectory[i + 1], tau_new)
     values[i + 1] = V_new
 
     # check termination
@@ -376,7 +445,9 @@ ax.grid(True, alpha=0.3)
 
 # --- Panel 4: attacker control ---
 ax = axes[1, 0]
-ax.set_title("Attacker control (NN bang-bang)")
+attacker_policy = 'MPC' if attacker_uses_mpc else 'NN bang-bang'
+defender_policy = 'MPC' if defender_uses_mpc else 'NN bang-bang'
+ax.set_title(f"Attacker control ({attacker_policy})")
 ax.set_xlabel("Time [s]")
 ax.set_ylabel("Acceleration [m/s²]")
 
@@ -391,7 +462,7 @@ ax.grid(True, alpha=0.3)
 
 # --- Panel 5: defender control ---
 ax = axes[1, 1]
-ax.set_title("Defender control (NN bang-bang)")
+ax.set_title(f"Defender control ({defender_policy})")
 ax.set_xlabel("Time [s]")
 ax.set_ylabel("Acceleration [m/s²]")
 
@@ -417,12 +488,12 @@ ax.legend(fontsize=8)
 ax.grid(True, alpha=0.3)
 
 fig.suptitle(
-    f"NN-Controlled Simulation  |  ckpt={args.checkpoint}  |  "
+    f"{attacker_policy} Attacker vs {defender_policy} Defender  |  ckpt={args.checkpoint}  |  "
     f"Outcome: {outcome} at t={outcome_time:.3f}s",
     fontsize=13, fontweight="bold")
 fig.tight_layout()
 
-save_path = os.path.join(experiment_dir, f"nn_simulation_ckpt{args.checkpoint}.png")
+save_path = os.path.join(experiment_dir, f"{args.controller}_simulation_ckpt{args.checkpoint}.png")
 fig.savefig(save_path, dpi=150, bbox_inches="tight")
 print(f"\nPlot saved to {save_path}")
 plt.show()

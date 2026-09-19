@@ -93,6 +93,31 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--CSL_loss_weight', type=float, default=1.0, help='weight of cost loss (relative to PDE loss)')
     p.add_argument('--CSL_batch_size', type=int, default=1000, help='Batch size for training in CSL phases')
 
+    # MPC-guided data supervision options
+    p.add_argument('--use_mpc_guidance', default=False, action='store_true', help='use sampling-based MPC labels to guide training')
+    p.add_argument('--mpc_dt', type=float, default=0.02, help='Integration timestep used by the MPC rollout')
+    p.add_argument('--mpc_horizon_steps', type=int, default=25, help='Number of MPC rollout steps (mpc_dt * mpc_horizon_steps should cover tMax)')
+    p.add_argument('--mpc_num_samples', type=int, default=128, help='Number of sampled attacker control sequences per MPC iteration')
+    p.add_argument('--mpc_iterations', type=int, default=5, help='Number of iterative MPC refinement rounds')
+    p.add_argument('--mpc_control_hold_steps', type=int, default=10, help='Number of rollout steps sharing each sampled control perturbation')
+    p.add_argument('--mpc_noise_fraction', type=float, default=0.25, help='Gaussian std as a fraction of the optimized player control bound')
+    p.add_argument('--mpc_noise_std', type=float, default=None, help='Absolute Gaussian std; overrides --mpc_noise_fraction')
+    p.add_argument('--mpc_initial_guess', type=str, default='network', choices=['network', 'zero'], help='Initial MPC plan at each dataset refresh')
+    p.add_argument('--mpc_optimized_player', type=str, default='attacker', choices=['attacker', 'defender', 'both', 'joint'], help="MPC label mode; 'both' runs separate best responses, 'joint' runs MPC-vs-MPC")
+    p.add_argument('--mpc_integrator', type=str, default='euler', choices=['euler', 'rk4'], help='Integration scheme used by the MPC rollout')
+    p.add_argument('--mpc_candidate_chunk_size', type=int, default=None, help='Process MPC candidates in chunks of this size to limit memory use')
+    p.add_argument('--mpc_num_initial_states', type=int, default=256, help='Number of initial states sampled per MPC dataset refresh')
+    p.add_argument('--mpc_state_distribution', type=str, default='interception', choices=['uniform', 'interception'], help='Initial-state distribution used for MPC label generation')
+    p.add_argument('--mpc_defender_position_std', type=float, default=0.5, help='Defender position standard deviation around the origin in metres')
+    p.add_argument('--mpc_attacker_boundary_std', type=float, default=0.2, help='Attacker inward distance standard deviation from a position-domain boundary in metres')
+    p.add_argument('--mpc_start_epoch', type=int, default=0, help='First global training epoch at which MPC replay generation is enabled')
+    p.add_argument('--mpc_refresh_epochs', type=int, default=1000, help='Epochs between MPC dataset refreshes')
+    p.add_argument('--mpc_replay_capacity', type=int, default=200000, help='Maximum number of MPC labels retained in the replay buffer')
+    p.add_argument('--mpc_reset_replay', default=False, action='store_true', help='Discard saved MPC labels when resuming while preserving the network and curriculum state')
+    p.add_argument('--mpc_batch_size', type=int, default=1000, help='Batch size sampled from the MPC replay buffer each training step')
+    p.add_argument('--mpc_loss_weight', type=float, default=1.0, help='Weight of the MPC data loss relative to the BRAT PDE loss')
+    p.add_argument('--mpc_seed', type=int, default=None, help='Seed for MPC control sampling (None uses the global RNG)')
+
     # validation (during training) options
     p.add_argument('--val_x_resolution', type=int, default=200, help='x-axis resolution of validation plot during training')
     p.add_argument('--val_y_resolution', type=int, default=200, help='y-axis resolution of validation plot during training')
@@ -167,8 +192,7 @@ if use_wandb:
     if not wandb_run_id:
         with open(wandb_id_path, 'w') as wandb_id_file:
             wandb_id_file.write(wandb.run.id)
-    if not opt.resume:
-        wandb.config.update(opt)
+    wandb.config.update(vars(opt), allow_val_change=opt.resume)
 
 current_time = datetime.now()
 # log current config
@@ -225,13 +249,58 @@ if (mode == 'all') or (mode == 'train'):
         loss_fn = losses.init_brat_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
     else:
         raise NotImplementedError
+
+    mpc_config = None
+    mpc_replay_buffer = None
+    use_mpc_guidance = opt.use_mpc_guidance or getattr(orig_opt, 'use_mpc_guidance', False)
+    mpc_options = opt if opt.use_mpc_guidance else orig_opt
+    if use_mpc_guidance:
+        from controllers.mpc import MPCConfig
+        from utils.mpc_data import MPCReplayBuffer
+        def make_mpc_config(control_bound, action_dim):
+            absolute_noise = getattr(mpc_options, 'mpc_noise_std', None)
+            noise_fraction = getattr(mpc_options, 'mpc_noise_fraction', 0.25)
+            noise_std = (absolute_noise if absolute_noise is not None
+                         else noise_fraction * control_bound)
+            return MPCConfig(
+                dt=mpc_options.mpc_dt,
+                horizon_steps=mpc_options.mpc_horizon_steps,
+                num_samples=mpc_options.mpc_num_samples,
+                num_iterations=mpc_options.mpc_iterations,
+                noise_std=noise_std,
+                control_lower=torch.full((action_dim,), -control_bound),
+                control_upper=torch.full((action_dim,), control_bound),
+                integration_method=mpc_options.mpc_integrator,
+                candidate_chunk_size=mpc_options.mpc_candidate_chunk_size,
+                control_hold_steps=getattr(mpc_options, 'mpc_control_hold_steps', 10),
+            )
+
+        mpc_config = {
+            'attacker': make_mpc_config(dynamics.accel_max_a, dynamics.control_dim),
+            'defender': make_mpc_config(dynamics.accel_max_d, dynamics.disturbance_dim),
+        }
+        mpc_replay_buffer = MPCReplayBuffer(
+            state_dim=dynamics.state_dim, capacity=mpc_options.mpc_replay_capacity)
+
     experiment.train(
         device=opt.device, batch_size=orig_opt.batch_size, epochs=orig_opt.num_epochs, lr=orig_opt.lr, 
         steps_til_summary=orig_opt.steps_til_summary, epochs_til_checkpoint=orig_opt.epochs_til_ckpt, 
         loss_fn=loss_fn, clip_grad=orig_opt.clip_grad, use_lbfgs=orig_opt.use_lbfgs, adjust_relative_grads=orig_opt.adj_rel_grads,
         val_x_resolution=orig_opt.val_x_resolution, val_y_resolution=orig_opt.val_y_resolution, val_z_resolution=orig_opt.val_z_resolution, val_time_resolution=orig_opt.val_time_resolution,
         use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size,
-        resume=opt.resume, autosave_epochs=opt.autosave_epochs, additional_epochs=opt.additional_epochs)
+        resume=opt.resume, autosave_epochs=opt.autosave_epochs, additional_epochs=opt.additional_epochs,
+        use_mpc_guidance=use_mpc_guidance, mpc_config=mpc_config, mpc_replay_buffer=mpc_replay_buffer,
+        mpc_num_initial_states=getattr(mpc_options, 'mpc_num_initial_states', 256),
+        mpc_start_epoch=getattr(mpc_options, 'mpc_start_epoch', 0),
+        mpc_refresh_epochs=getattr(mpc_options, 'mpc_refresh_epochs', 1000),
+        mpc_state_distribution=getattr(mpc_options, 'mpc_state_distribution', 'interception'),
+        mpc_defender_position_std=getattr(mpc_options, 'mpc_defender_position_std', 0.5),
+        mpc_attacker_boundary_std=getattr(mpc_options, 'mpc_attacker_boundary_std', 0.2),
+        mpc_reset_replay=getattr(mpc_options, 'mpc_reset_replay', False),
+        mpc_batch_size=getattr(mpc_options, 'mpc_batch_size', 1000), mpc_loss_weight=getattr(mpc_options, 'mpc_loss_weight', 1.0),
+        mpc_seed=getattr(mpc_options, 'mpc_seed', None),
+        mpc_initial_guess=getattr(mpc_options, 'mpc_initial_guess', 'network'),
+        mpc_optimized_player=getattr(mpc_options, 'mpc_optimized_player', 'attacker'))
 
 if (mode == 'all') or (mode == 'test'):
     experiment.test(

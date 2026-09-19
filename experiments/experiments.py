@@ -22,6 +22,67 @@ from datetime import datetime
 from sklearn import svm 
 from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
+from controllers.bang_bang import NeuralBangBangController
+from controllers.mpc import optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences
+
+
+def sample_mpc_initial_states(
+        dynamics, num_samples, distribution='uniform',
+        defender_position_std=0.5, attacker_boundary_std=0.2):
+    if distribution == 'uniform':
+        model_states = torch.zeros(num_samples, dynamics.state_dim).uniform_(-1, 1)
+        return dynamics.input_to_coord(
+            torch.cat((torch.zeros(num_samples, 1), model_states), dim=1)
+        )[:, 1:]
+    if distribution != 'interception':
+        raise ValueError("distribution must be 'uniform' or 'interception'")
+    if dynamics.state_dim != 8 or not all(
+            hasattr(dynamics, name) for name in ('target_R', 'capture_R')):
+        raise ValueError("interception sampling requires the 8D interception dynamics")
+    if defender_position_std <= 0 or attacker_boundary_std <= 0:
+        raise ValueError('position standard deviations must be positive')
+
+    state_mean = dynamics.state_mean.to(dtype=torch.float32)
+    state_var = dynamics.state_var.to(dtype=torch.float32)
+    lower = state_mean - state_var
+    upper = state_mean + state_var
+    states = state_mean.unsqueeze(0).expand(num_samples, -1).clone()
+
+    side = torch.randint(4, (num_samples,))
+    inward_distance = torch.abs(torch.randn(num_samples)) * attacker_boundary_std
+    horizontal_side = side < 2
+    states[:, 0] = torch.empty(num_samples).uniform_(lower[0].item(), upper[0].item())
+    states[:, 2] = torch.empty(num_samples).uniform_(lower[2].item(), upper[2].item())
+    states[horizontal_side, 0] = torch.where(
+        side[horizontal_side] == 0,
+        lower[0] + inward_distance[horizontal_side],
+        upper[0] - inward_distance[horizontal_side],
+    ).clamp(lower[0], upper[0])
+    states[~horizontal_side, 2] = torch.where(
+        side[~horizontal_side] == 2,
+        lower[2] + inward_distance[~horizontal_side],
+        upper[2] - inward_distance[~horizontal_side],
+    ).clamp(lower[2], upper[2])
+
+    exclusion_radius = dynamics.target_R + dynamics.capture_R
+    accepted_positions = []
+    accepted_count = 0
+    while accepted_count < num_samples:
+        candidates = torch.randn(max(2 * (num_samples - accepted_count), 16), 2) * defender_position_std
+        inside_domain = (
+            (candidates[:, 0] >= lower[4]) & (candidates[:, 0] <= upper[4]) &
+            (candidates[:, 1] >= lower[6]) & (candidates[:, 1] <= upper[6]))
+        outside_exclusion = torch.linalg.vector_norm(candidates, dim=-1) > exclusion_radius
+        accepted = candidates[inside_domain & outside_exclusion]
+        accepted_positions.append(accepted)
+        accepted_count += accepted.shape[0]
+    defender_positions = torch.cat(accepted_positions, dim=0)[:num_samples]
+    states[:, 4] = defender_positions[:, 0]
+    states[:, 6] = defender_positions[:, 1]
+    states[:, 1] = torch.empty(num_samples).uniform_(lower[1].item(), upper[1].item())
+    states[:, 3] = torch.empty(num_samples).uniform_(lower[3].item(), upper[3].item())
+    states[:, [5, 7]] = 0.0
+    return states
 
 class Experiment(ABC):
     def __init__(self, model, dataset, experiment_dir, use_wandb):
@@ -60,7 +121,7 @@ class Experiment(ABC):
                     return False
                 time.sleep(0.5)
 
-    def _training_checkpoint(self, epoch, total_steps, optimizer, train_losses, last_CSL_epoch, new_weight):
+    def _training_checkpoint(self, epoch, total_steps, optimizer, train_losses, last_CSL_epoch, new_weight, mpc_replay_buffer=None):
         return {
             'epoch': epoch,
             'total_steps': total_steps,
@@ -74,7 +135,101 @@ class Experiment(ABC):
             'numpy_random_state': np.random.get_state(),
             'torch_random_state': torch.get_rng_state(),
             'cuda_random_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            'mpc_replay_buffer': mpc_replay_buffer.state_dict() if mpc_replay_buffer is not None else None,
         }
+
+    def _refresh_mpc_dataset(
+            self, device, mpc_configs, num_initial_states, replay_buffer,
+            optimized_player, generator=None, initial_guess='zero',
+            state_distribution='uniform', defender_position_std=0.5,
+            attacker_boundary_std=0.2):
+        """Generate BRAT MPC labels against the current policy and add bootstrapped trajectory suffixes to `replay_buffer`."""
+        dynamics = self.dataset.dynamics
+        required_methods = ('reach_fn', 'avoid_fn', 'optimal_control', 'optimal_disturbance')
+        if not all(hasattr(dynamics, name) for name in required_methods):
+            raise NotImplementedError(
+                'MPC guidance requires a dynamics class implementing reach_fn, avoid_fn, '
+                'optimal_control, and optimal_disturbance')
+
+        was_training = self.model.training
+        requires_grad_flags = [parameter.requires_grad for parameter in self.model.parameters()]
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+        times = self.dataset._sample_times(num_initial_states).squeeze(-1).to(device)
+        real_states = sample_mpc_initial_states(
+            dynamics, num_initial_states, state_distribution,
+            defender_position_std, attacker_boundary_std).to(device)
+
+        responder = NeuralBangBangController(model=self.model, dynamics=dynamics, device=device)
+        if initial_guess not in ('network', 'zero'):
+            raise ValueError("initial_guess must be 'network' or 'zero'")
+        initial_query = responder.query(real_states, times) if initial_guess == 'network' else None
+
+        def initial_sequence(network_actions, horizon_steps, action_dim):
+            if network_actions is not None:
+                return network_actions[:, None, :].expand(
+                    num_initial_states, horizon_steps, action_dim).clone()
+            return torch.zeros(num_initial_states, horizon_steps, action_dim, device=device)
+
+        if optimized_player == 'attacker':
+            mpc_config = mpc_configs['attacker']
+            nominal_sequence = initial_sequence(
+                initial_query.controls if initial_query is not None else None,
+                mpc_config.horizon_steps, dynamics.control_dim)
+            result = optimize_control_sequence(
+                real_states, times, nominal_sequence, responder, dynamics, mpc_config,
+                generator=generator, use_network_terminal_value=True,
+            )
+        elif optimized_player == 'defender':
+            mpc_config = mpc_configs['defender']
+            nominal_sequence = initial_sequence(
+                initial_query.disturbances if initial_query is not None else None,
+                mpc_config.horizon_steps, dynamics.disturbance_dim)
+            result = optimize_disturbance_sequence(
+                real_states, times, nominal_sequence, responder, dynamics, mpc_config,
+                generator=generator, use_network_terminal_value=True,
+            )
+        elif optimized_player == 'joint':
+            attacker_config = mpc_configs['attacker']
+            defender_config = mpc_configs['defender']
+            nominal_controls = initial_sequence(
+                initial_query.controls if initial_query is not None else None,
+                attacker_config.horizon_steps, dynamics.control_dim)
+            nominal_disturbances = initial_sequence(
+                initial_query.disturbances if initial_query is not None else None,
+                defender_config.horizon_steps, dynamics.disturbance_dim)
+            result = optimize_joint_sequences(
+                real_states, times, nominal_controls, nominal_disturbances,
+                responder, dynamics, attacker_config, defender_config,
+                generator=generator, use_network_terminal_value=True,
+            )
+            mpc_config = attacker_config
+        else:
+            raise ValueError("optimized_player must be 'attacker', 'defender', or 'joint'")
+
+        horizon_plus_one = result.states.shape[1]
+        label_times = torch.stack(
+            [torch.clamp(times - step * mpc_config.dt, min=0.0) for step in range(horizon_plus_one)], dim=1)
+
+        replay_buffer.add(
+            label_times.reshape(-1).detach().cpu(),
+            result.states.reshape(-1, dynamics.state_dim).detach().cpu(),
+            result.suffix_values.reshape(-1).detach().cpu(),
+        )
+
+        print('%s MPC dataset refresh: %d initial states, %d labels added, replay buffer size %d' % (
+            optimized_player.capitalize(), num_initial_states, label_times.numel(), len(replay_buffer)))
+        if self.use_wandb:
+            wandb.log({
+                'mpc_replay_buffer_size': len(replay_buffer),
+                'mpc_%s_mean_score' % optimized_player: result.score.mean().item(),
+            })
+
+        for parameter, required_grad in zip(self.model.parameters(), requires_grad_flags):
+            parameter.requires_grad_(required_grad)
+        if was_training:
+            self.model.train()
 
     def validate(self, device, epoch, save_path, x_resolution, y_resolution, z_resolution, time_resolution):
         was_training = self.model.training
@@ -201,10 +356,31 @@ class Experiment(ABC):
             val_x_resolution, val_y_resolution, val_z_resolution, val_time_resolution,
             use_CSL, CSL_lr, CSL_dt, epochs_til_CSL, num_CSL_samples, CSL_loss_frac_cutoff, max_CSL_epochs, CSL_loss_weight, CSL_batch_size,
             resume=False, autosave_epochs=10, additional_epochs=0,
+            use_mpc_guidance=False, mpc_config=None, mpc_replay_buffer=None,
+            mpc_num_initial_states=256, mpc_start_epoch=0,
+            mpc_refresh_epochs=1000, mpc_batch_size=1000,
+            mpc_state_distribution='interception', mpc_defender_position_std=0.5,
+            mpc_attacker_boundary_std=0.2, mpc_reset_replay=False,
+            mpc_loss_weight=1.0, mpc_seed=None, mpc_initial_guess='network',
+            mpc_optimized_player='attacker',
         ):
         was_eval = not self.model.training
         self.model.train()
         self.model.requires_grad_(True)
+
+        mpc_generator = None
+        if use_mpc_guidance:
+            if mpc_config is None or mpc_replay_buffer is None:
+                raise ValueError('use_mpc_guidance requires both mpc_config and mpc_replay_buffer')
+            if mpc_optimized_player not in ('attacker', 'defender', 'both', 'joint'):
+                raise ValueError("mpc_optimized_player must be 'attacker', 'defender', 'both', or 'joint'")
+            if mpc_initial_guess not in ('network', 'zero'):
+                raise ValueError("mpc_initial_guess must be 'network' or 'zero'")
+            if mpc_start_epoch < 0:
+                raise ValueError('mpc_start_epoch must be non-negative')
+            if mpc_seed is not None:
+                mpc_generator = torch.Generator(device=device)
+                mpc_generator.manual_seed(mpc_seed)
 
         train_dataloader = DataLoader(self.dataset, shuffle=True, batch_size=batch_size, pin_memory=True, num_workers=0)
 
@@ -253,13 +429,22 @@ class Experiment(ABC):
             train_losses = checkpoint.get('train_losses', [])
             last_CSL_epoch = checkpoint.get('last_CSL_epoch', -1)
             new_weight = checkpoint.get('new_weight', 1)
-            dataset_state = checkpoint.get('dataset', {})
-            self.dataset.load_state_dict(dataset_state)
+            dataset_state = checkpoint.get('dataset')
+            if dataset_state:
+                self.dataset.load_state_dict(dataset_state)
+            else:
+                self.dataset.restore_progress_from_epoch(start_epoch)
+                print('Checkpoint has no dataset state; inferred curriculum progress from epoch %d' % start_epoch)
             random.setstate(checkpoint['random_state'])
             np.random.set_state(checkpoint['numpy_random_state'])
             torch.set_rng_state(checkpoint['torch_random_state'])
             if torch.cuda.is_available() and checkpoint.get('cuda_random_state') is not None:
                 torch.cuda.set_rng_state_all(checkpoint['cuda_random_state'])
+            if (use_mpc_guidance and not mpc_reset_replay and
+                    checkpoint.get('mpc_replay_buffer') is not None):
+                mpc_replay_buffer.load_state_dict(checkpoint['mpc_replay_buffer'])
+            elif use_mpc_guidance and mpc_reset_replay:
+                print('Resetting saved MPC replay buffer for resumed training')
             print('Resuming training from completed epoch %d' % start_epoch)
 
         target_epochs = epochs + additional_epochs
@@ -276,6 +461,18 @@ class Experiment(ABC):
                         self.dataset.learned_boundary_fraction > 0 and
                         not epoch % self.dataset.learned_boundary_update_epochs):
                     self._update_learned_boundary_samples(device)
+                if (use_mpc_guidance and epoch >= mpc_start_epoch and
+                    not self.dataset.pretrain and
+                        not epoch % mpc_refresh_epochs):
+                    optimized_players = (('attacker', 'defender')
+                                         if mpc_optimized_player == 'both'
+                                         else (mpc_optimized_player,))
+                    for optimized_player in optimized_players:
+                        self._refresh_mpc_dataset(
+                            device, mpc_config, mpc_num_initial_states,
+                            mpc_replay_buffer, optimized_player, mpc_generator,
+                            mpc_initial_guess, mpc_state_distribution,
+                            mpc_defender_position_std, mpc_attacker_boundary_std)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)
@@ -305,6 +502,18 @@ class Experiment(ABC):
                         losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, reach_values, avoid_values, dirichlet_masks, model_results['model_out'])
                     else:
                         raise NotImplementedError
+
+                    if use_mpc_guidance and len(mpc_replay_buffer) > 0:
+                        mpc_times, mpc_states, mpc_targets = mpc_replay_buffer.sample(mpc_batch_size, device)
+                        mpc_coords = torch.cat((mpc_times.unsqueeze(-1), mpc_states), dim=-1)
+                        if self.dataset.dynamics.input_dim > self.dataset.dynamics.state_dim + 1:
+                            mpc_coords = torch.cat((
+                                mpc_coords,
+                                torch.zeros(mpc_coords.shape[0], self.dataset.dynamics.input_dim - self.dataset.dynamics.state_dim - 1, device=device)), dim=1)
+                        mpc_model_input = self.dataset.dynamics.coord_to_input(mpc_coords)
+                        mpc_results = self.model({'coords': mpc_model_input})
+                        mpc_preds = self.dataset.dynamics.io_to_value(mpc_results['model_in'], mpc_results['model_out'].squeeze(dim=-1))
+                        losses['mpc_data'] = mpc_loss_weight * torch.mean((mpc_preds - mpc_targets) ** 2)
                     
                     if use_lbfgs:
                         def closure():
@@ -395,11 +604,15 @@ class Experiment(ABC):
                     if not total_steps % steps_til_summary:
                         tqdm.write("Epoch %d, Total loss %0.6f, iteration time %0.6f" % (epoch, train_loss, time.time() - start_time))
                         if self.use_wandb:
-                            wandb.log({
+                            wandb_metrics = {
                                 'step': epoch,
                                 'train_loss': train_loss,
                                 'pde_loss': losses['diff_constraint_hom'],
-                            })
+                            }
+                            if 'mpc_data' in losses:
+                                wandb_metrics['mpc_data_loss'] = losses['mpc_data']
+                                wandb_metrics['mpc_loss_weight'] = mpc_loss_weight
+                            wandb.log(wandb_metrics)
 
                     total_steps += 1
 
@@ -591,7 +804,7 @@ class Experiment(ABC):
 
                 completed_epochs = epoch + 1
                 checkpoint = self._training_checkpoint(
-                    completed_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight)
+                    completed_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight, mpc_replay_buffer)
                 if (completed_epochs == 1 or
                         not completed_epochs % autosave_epochs or
                         not completed_epochs % epochs_til_checkpoint):
@@ -607,7 +820,7 @@ class Experiment(ABC):
                         x_resolution = val_x_resolution, y_resolution = val_y_resolution, z_resolution=val_z_resolution, time_resolution=val_time_resolution)
 
         final_checkpoint = self._training_checkpoint(
-            target_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight)
+            target_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight, mpc_replay_buffer)
         self._atomic_torch_save(final_checkpoint, resume_checkpoint_path)
         self._atomic_torch_save(self.model.state_dict(), os.path.join(checkpoints_dir, 'model_final.pth'))
         writer.close()

@@ -46,6 +46,17 @@ class ReachabilityDataset(Dataset):
         self.counter = state.get('counter', self.counter)
         self.learned_boundary_coords = state.get('learned_boundary_coords', self.learned_boundary_coords)
 
+    def restore_progress_from_epoch(self, completed_epochs):
+        """Infer curriculum state for checkpoints created before dataset state was saved."""
+        if completed_epochs < 0:
+            raise ValueError('completed_epochs must be non-negative')
+        curriculum_epochs = completed_epochs
+        if self.pretrain:
+            self.pretrain_counter = min(completed_epochs, self.pretrain_iters)
+            self.pretrain = completed_epochs < self.pretrain_iters
+            curriculum_epochs = max(completed_epochs - self.pretrain_iters, 0)
+        self.counter = min(self.counter + curriculum_epochs, self.counter_end)
+
     def _current_t_max(self):
         if self.pretrain:
             return self.tMin

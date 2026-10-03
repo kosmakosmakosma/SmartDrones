@@ -105,7 +105,7 @@ class Experiment(ABC):
 
     @staticmethod
     def _atomic_torch_save(value, path):
-        temporary_path = path + '.tmp'
+        temporary_path = '%s.tmp.%d' % (path, os.getpid())
         torch.save(value, temporary_path)
         for attempt in range(5):
             try:
@@ -120,6 +120,32 @@ class Experiment(ABC):
                         pass
                     return False
                 time.sleep(0.5)
+
+    @staticmethod
+    def _load_training_checkpoint(checkpoints_dir, resume_path):
+        try:
+            return torch.load(resume_path, map_location='cpu', weights_only=False)
+        except Exception as error:
+            print('Warning: could not load %s (%s)' % (resume_path, error))
+
+        epoch_paths = []
+        for filename in os.listdir(checkpoints_dir):
+            if filename.startswith('model_epoch_') and filename.endswith('.pth'):
+                try:
+                    epoch = int(filename[len('model_epoch_'):-len('.pth')])
+                except ValueError:
+                    continue
+                epoch_paths.append((epoch, os.path.join(checkpoints_dir, filename)))
+
+        for _, path in sorted(epoch_paths, reverse=True):
+            try:
+                checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+                print('Recovered resume state from %s' % os.path.basename(path))
+                return checkpoint
+            except Exception as error:
+                print('Warning: could not load fallback checkpoint %s (%s)' % (path, error))
+
+        raise RuntimeError('Cannot resume: no valid training checkpoint found in %s' % checkpoints_dir)
 
     def _training_checkpoint(self, epoch, total_steps, optimizer, train_losses, last_CSL_epoch, new_weight, mpc_replay_buffer=None):
         return {
@@ -417,7 +443,7 @@ class Experiment(ABC):
         if resume:
             if not os.path.exists(resume_checkpoint_path):
                 raise RuntimeError('Cannot resume: %s does not exist' % resume_checkpoint_path)
-            checkpoint = torch.load(resume_checkpoint_path, map_location='cpu', weights_only=False)
+            checkpoint = self._load_training_checkpoint(checkpoints_dir, resume_checkpoint_path)
             self.model.load_state_dict(checkpoint['model'])
             optim.load_state_dict(checkpoint['optimizer'])
             for optimizer_state in optim.state.values():

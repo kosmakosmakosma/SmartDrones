@@ -3,7 +3,7 @@
 .\env\Scripts\python.exe run_experiment.py `
   --mode train `
   --experiment_class DeepReach `
-  --experiment_name crazyflie_2d_no_grav_test3 `
+  --experiment_name crazyflie_2d_no_grav_mpc_test1 `
   --dynamics_class CrazyflieInterception `
   --minWith target `
   --target_R 0.25 `
@@ -44,8 +44,8 @@
   --use_wandb `
   --wandb_project SmartDrones `
   --wandb_entity kosmakosmakosma-tu-delft `
-  --wandb_group 2d_drones_no_grav `
-  --wandb_name test3
+  --wandb_group 2d_drones_no_grav_mpc `
+  --wandb_name test1
 
 ## 1. Objective
 

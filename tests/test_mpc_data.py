@@ -135,3 +135,48 @@ def test_interception_mpc_states_match_requested_spatial_distributions():
 
     attacker_edge_distance = 2.0 - torch.amax(torch.abs(states[:, [0, 2]]), dim=-1)
     assert torch.mean((attacker_edge_distance <= 0.4).float()) > 0.94
+
+
+def test_defender_exclusion_radius_is_configurable():
+    dynamics = CrazyflieInterception(
+        target_R=0.25, capture_R=0.2, accel_max_a=5.0, accel_max_d=7.0, defender_exclusion_R=0.15)
+    state = torch.zeros(1, 8)
+    state[0, 0] = 1.5   # attacker far from target and defender
+    state[0, 4] = 0.3   # defender inside the old 0.45 ring, outside the new 0.15 ring
+    assert torch.allclose(dynamics.reach_fn(state), torch.tensor([0.15]))
+    assert dynamics.avoid_fn(state).item() > 0
+
+    torch.manual_seed(3)
+    states = experiments.sample_mpc_initial_states(dynamics, 2000, distribution='interception')
+    defender_radius = torch.linalg.vector_norm(states[:, [4, 6]], dim=-1)
+    assert torch.all(defender_radius > 0.15)
+    assert torch.any(defender_radius < 0.45)
+
+
+def test_inward_attacker_velocity_points_at_target():
+    torch.manual_seed(5)
+    dynamics = CrazyflieInterception(
+        target_R=0.25, capture_R=0.2, accel_max_a=5.0, accel_max_d=7.0)
+    states = experiments.sample_mpc_initial_states(
+        dynamics, 5000, distribution='interception',
+        attacker_velocity='inward', attacker_velocity_spread_deg=60.0)
+
+    position = states[:, [0, 2]]
+    velocity = states[:, [1, 3]]
+    speed = torch.linalg.vector_norm(velocity, dim=-1)
+    cosine = -(position * velocity).sum(-1) / (torch.linalg.vector_norm(position, dim=-1) * speed)
+    assert torch.all(cosine[speed > 1e-3] >= 0.5 - 1e-4)   # within 60 degrees of the target direction
+    assert torch.all(torch.abs(velocity) <= 3.0)
+
+
+def test_tmax_time_distribution_requires_finished_curriculum():
+    from utils.mpc_data import sample_mpc_initial_times
+    dataset = SimpleNamespace(tMax=1.0, _current_t_max=lambda: 1.0)
+    assert torch.equal(sample_mpc_initial_times(dataset, 3, 'tmax'), torch.ones(3))
+    dataset._current_t_max = lambda: 0.5
+    try:
+        sample_mpc_initial_times(dataset, 3, 'tmax')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('expected ValueError before the curriculum reaches tMax')

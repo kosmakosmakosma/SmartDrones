@@ -110,6 +110,10 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_state_distribution', type=str, default='interception', choices=['uniform', 'interception'], help='Initial-state distribution used for MPC label generation')
     p.add_argument('--mpc_defender_position_std', type=float, default=0.5, help='Defender position standard deviation around the origin in metres')
     p.add_argument('--mpc_attacker_boundary_std', type=float, default=0.2, help='Attacker inward distance standard deviation from a position-domain boundary in metres')
+    p.add_argument('--mpc_attacker_velocity', type=str, default='inward', choices=['uniform', 'inward'], help="Attacker initial velocity for interception sampling: 'inward' points at the target, 'uniform' samples each component independently")
+    p.add_argument('--mpc_attacker_velocity_spread_deg', type=float, default=60.0, help='Max angle in degrees between the inward attacker velocity and the direction to the target')
+    p.add_argument('--mpc_attacker_speed_max', type=float, default=None, help='Max inward attacker speed in m/s (defaults to the velocity domain bound)')
+    p.add_argument('--mpc_time_distribution', type=str, default='tmax', choices=['uniform', 'tmax'], help="Time-to-go of MPC initial states: 'tmax' starts every rollout at tMax, 'uniform' follows the training curriculum")
     p.add_argument('--mpc_start_epoch', type=int, default=0, help='First global training epoch at which MPC replay generation is enabled')
     p.add_argument('--mpc_refresh_epochs', type=int, default=1000, help='Epochs between MPC dataset refreshes')
     p.add_argument('--mpc_replay_capacity', type=int, default=200000, help='Maximum number of MPC labels retained in the replay buffer')
@@ -136,6 +140,8 @@ if (mode == 'all') or (mode == 'train'):
     for param in dynamics_params.keys():
         if dynamics_params[param].annotation is bool:
             p.add_argument('--' + param, type=dynamics_params[param].annotation, default=False, help='special dynamics_class argument')
+        elif dynamics_params[param].default is not inspect.Parameter.empty:
+            p.add_argument('--' + param, type=dynamics_params[param].annotation, default=dynamics_params[param].default, help='special dynamics_class argument')
         else:
             p.add_argument('--' + param, type=dynamics_params[param].annotation, required=True, help='special dynamics_class argument')
 
@@ -219,7 +225,7 @@ random.seed(orig_opt.seed)
 np.random.seed(orig_opt.seed)
 
 dynamics_class = getattr(dynamics, orig_opt.dynamics_class)
-dynamics = dynamics_class(**{argname: getattr(orig_opt, argname) for argname in inspect.signature(dynamics_class).parameters.keys() if argname != 'self'})
+dynamics = dynamics_class(**{argname: getattr(orig_opt, argname) for argname, param in inspect.signature(dynamics_class).parameters.items() if argname != 'self' and (hasattr(orig_opt, argname) or param.default is inspect.Parameter.empty)})
 dynamics.deepreach_model=orig_opt.deepreach_model
 dataset = dataio.ReachabilityDataset(
     dynamics=dynamics, numpoints=orig_opt.numpoints, 
@@ -297,6 +303,10 @@ if (mode == 'all') or (mode == 'train'):
         mpc_defender_position_std=getattr(mpc_options, 'mpc_defender_position_std', 0.5),
         mpc_attacker_boundary_std=getattr(mpc_options, 'mpc_attacker_boundary_std', 0.2),
         mpc_reset_replay=getattr(mpc_options, 'mpc_reset_replay', False),
+        mpc_attacker_velocity=getattr(mpc_options, 'mpc_attacker_velocity', 'uniform'),
+        mpc_attacker_velocity_spread_deg=getattr(mpc_options, 'mpc_attacker_velocity_spread_deg', 60.0),
+        mpc_attacker_speed_max=getattr(mpc_options, 'mpc_attacker_speed_max', None),
+        mpc_time_distribution=getattr(mpc_options, 'mpc_time_distribution', 'uniform'),
         mpc_batch_size=getattr(mpc_options, 'mpc_batch_size', 1000), mpc_loss_weight=getattr(mpc_options, 'mpc_loss_weight', 1.0),
         mpc_seed=getattr(mpc_options, 'mpc_seed', None),
         mpc_initial_guess=getattr(mpc_options, 'mpc_initial_guess', 'network'),

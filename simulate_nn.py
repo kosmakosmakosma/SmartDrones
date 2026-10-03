@@ -79,8 +79,8 @@ with open(os.path.join(experiment_dir, 'orig_opt.pickle'), 'rb') as f:
 dynamics_class = getattr(dynamics_module, orig_opt.dynamics_class)
 dynamics_params = {
     name: getattr(orig_opt, name)
-    for name in inspect.signature(dynamics_class).parameters.keys()
-    if name != 'self'
+    for name, param in inspect.signature(dynamics_class).parameters.items()
+    if name != 'self' and (hasattr(orig_opt, name) or param.default is inspect.Parameter.empty)
 }
 dynamics = dynamics_class(**dynamics_params)
 dynamics.deepreach_model = orig_opt.deepreach_model
@@ -120,7 +120,7 @@ print(f"Architecture: {orig_opt.num_hl} hidden layers, {orig_opt.num_nl} neurons
 # ──────────────────────────────────────────────────
 target_R = dynamics.target_R
 capture_R = dynamics.capture_R
-defender_exclusion_R = target_R + capture_R
+defender_exclusion_R = dynamics.defender_exclusion_R
 accel_max_a = dynamics.accel_max_a
 accel_max_d = dynamics.accel_max_d
 tMax = orig_opt.tMax  # training time horizon

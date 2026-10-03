@@ -84,7 +84,7 @@ class ReachabilityDataset(Dataset):
 
         if num_exclusion:
             angles = 2 * torch.pi * torch.rand(num_exclusion)
-            radii = self.dynamics.target_R + self.dynamics.capture_R + 0.03 * torch.randn(num_exclusion)
+            radii = getattr(self.dynamics, 'defender_exclusion_R', self.dynamics.target_R + self.dynamics.capture_R) + 0.03 * torch.randn(num_exclusion)
             states[num_target:, 4] = radii * torch.cos(angles)
             states[num_target:, 6] = radii * torch.sin(angles)
 

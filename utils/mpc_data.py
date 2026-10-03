@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -49,3 +51,93 @@ class MPCReplayBuffer:
         self.times = state["times"]
         self.states = state["states"]
         self.values = state["values"]
+
+
+def sample_mpc_initial_states(
+        dynamics, num_samples, distribution='uniform',
+        defender_position_std=0.5, attacker_boundary_std=0.2,
+        attacker_velocity='uniform', attacker_velocity_spread_deg=60.0,
+        attacker_speed_max=None):
+    """Real-unit initial states for MPC label generation.
+
+    attacker_velocity='inward' points the attacker velocity at the target (origin)
+    rotated by a uniform angle in +-attacker_velocity_spread_deg, with a uniform speed
+    in [0, attacker_speed_max]; 'uniform' samples each velocity component independently.
+    """
+    if distribution == 'uniform':
+        model_states = torch.zeros(num_samples, dynamics.state_dim).uniform_(-1, 1)
+        return dynamics.input_to_coord(
+            torch.cat((torch.zeros(num_samples, 1), model_states), dim=1)
+        )[:, 1:]
+    if distribution != 'interception':
+        raise ValueError("distribution must be 'uniform' or 'interception'")
+    if dynamics.state_dim != 8 or not all(
+            hasattr(dynamics, name) for name in ('target_R', 'capture_R')):
+        raise ValueError("interception sampling requires the 8D interception dynamics")
+    if defender_position_std <= 0 or attacker_boundary_std <= 0:
+        raise ValueError('position standard deviations must be positive')
+
+    state_mean = dynamics.state_mean.to(dtype=torch.float32)
+    state_var = dynamics.state_var.to(dtype=torch.float32)
+    lower = state_mean - state_var
+    upper = state_mean + state_var
+    states = state_mean.unsqueeze(0).expand(num_samples, -1).clone()
+
+    side = torch.randint(4, (num_samples,))
+    inward_distance = torch.abs(torch.randn(num_samples)) * attacker_boundary_std
+    horizontal_side = side < 2
+    states[:, 0] = torch.empty(num_samples).uniform_(lower[0].item(), upper[0].item())
+    states[:, 2] = torch.empty(num_samples).uniform_(lower[2].item(), upper[2].item())
+    states[horizontal_side, 0] = torch.where(
+        side[horizontal_side] == 0,
+        lower[0] + inward_distance[horizontal_side],
+        upper[0] - inward_distance[horizontal_side],
+    ).clamp(lower[0], upper[0])
+    states[~horizontal_side, 2] = torch.where(
+        side[~horizontal_side] == 2,
+        lower[2] + inward_distance[~horizontal_side],
+        upper[2] - inward_distance[~horizontal_side],
+    ).clamp(lower[2], upper[2])
+
+    exclusion_radius = getattr(dynamics, 'defender_exclusion_R', dynamics.target_R + dynamics.capture_R)
+    accepted_positions = []
+    accepted_count = 0
+    while accepted_count < num_samples:
+        candidates = torch.randn(max(2 * (num_samples - accepted_count), 16), 2) * defender_position_std
+        inside_domain = (
+            (candidates[:, 0] >= lower[4]) & (candidates[:, 0] <= upper[4]) &
+            (candidates[:, 1] >= lower[6]) & (candidates[:, 1] <= upper[6]))
+        outside_exclusion = torch.linalg.vector_norm(candidates, dim=-1) > exclusion_radius
+        accepted = candidates[inside_domain & outside_exclusion]
+        accepted_positions.append(accepted)
+        accepted_count += accepted.shape[0]
+    defender_positions = torch.cat(accepted_positions, dim=0)[:num_samples]
+    states[:, 4] = defender_positions[:, 0]
+    states[:, 6] = defender_positions[:, 1]
+    states[:, 1] = torch.empty(num_samples).uniform_(lower[1].item(), upper[1].item())
+    states[:, 3] = torch.empty(num_samples).uniform_(lower[3].item(), upper[3].item())
+    states[:, [5, 7]] = 0.0
+    if attacker_velocity == 'inward':
+        speed_limit = min(upper[1].item(), upper[3].item())
+        speed_max = speed_limit if attacker_speed_max is None else attacker_speed_max
+        heading = torch.atan2(-states[:, 2], -states[:, 0]) + torch.empty(num_samples).uniform_(
+            -math.radians(attacker_velocity_spread_deg), math.radians(attacker_velocity_spread_deg))
+        speed = torch.empty(num_samples).uniform_(0.0, speed_max)
+        states[:, 1] = (speed * torch.cos(heading)).clamp(lower[1], upper[1])
+        states[:, 3] = (speed * torch.sin(heading)).clamp(lower[3], upper[3])
+    elif attacker_velocity != 'uniform':
+        raise ValueError("attacker_velocity must be 'uniform' or 'inward'")
+    return states
+
+
+def sample_mpc_initial_times(dataset, num_samples, distribution='uniform'):
+    """Time-to-go for MPC initial states: 'uniform' follows the training curriculum, 'tmax' starts every rollout at tMax."""
+    if distribution == 'uniform':
+        return dataset._sample_times(num_samples).squeeze(-1)
+    if distribution == 'tmax':
+        if dataset._current_t_max() < dataset.tMax:
+            raise ValueError(
+                'mpc_time_distribution=tmax requires the time curriculum to have reached tMax '
+                '(set mpc_start_epoch after pretraining and counter_end)')
+        return torch.full((num_samples,), float(dataset.tMax))
+    raise ValueError("distribution must be 'uniform' or 'tmax'")

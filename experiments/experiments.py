@@ -24,65 +24,8 @@ from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences
+from utils.mpc_data import sample_mpc_initial_states, sample_mpc_initial_times
 
-
-def sample_mpc_initial_states(
-        dynamics, num_samples, distribution='uniform',
-        defender_position_std=0.5, attacker_boundary_std=0.2):
-    if distribution == 'uniform':
-        model_states = torch.zeros(num_samples, dynamics.state_dim).uniform_(-1, 1)
-        return dynamics.input_to_coord(
-            torch.cat((torch.zeros(num_samples, 1), model_states), dim=1)
-        )[:, 1:]
-    if distribution != 'interception':
-        raise ValueError("distribution must be 'uniform' or 'interception'")
-    if dynamics.state_dim != 8 or not all(
-            hasattr(dynamics, name) for name in ('target_R', 'capture_R')):
-        raise ValueError("interception sampling requires the 8D interception dynamics")
-    if defender_position_std <= 0 or attacker_boundary_std <= 0:
-        raise ValueError('position standard deviations must be positive')
-
-    state_mean = dynamics.state_mean.to(dtype=torch.float32)
-    state_var = dynamics.state_var.to(dtype=torch.float32)
-    lower = state_mean - state_var
-    upper = state_mean + state_var
-    states = state_mean.unsqueeze(0).expand(num_samples, -1).clone()
-
-    side = torch.randint(4, (num_samples,))
-    inward_distance = torch.abs(torch.randn(num_samples)) * attacker_boundary_std
-    horizontal_side = side < 2
-    states[:, 0] = torch.empty(num_samples).uniform_(lower[0].item(), upper[0].item())
-    states[:, 2] = torch.empty(num_samples).uniform_(lower[2].item(), upper[2].item())
-    states[horizontal_side, 0] = torch.where(
-        side[horizontal_side] == 0,
-        lower[0] + inward_distance[horizontal_side],
-        upper[0] - inward_distance[horizontal_side],
-    ).clamp(lower[0], upper[0])
-    states[~horizontal_side, 2] = torch.where(
-        side[~horizontal_side] == 2,
-        lower[2] + inward_distance[~horizontal_side],
-        upper[2] - inward_distance[~horizontal_side],
-    ).clamp(lower[2], upper[2])
-
-    exclusion_radius = dynamics.target_R + dynamics.capture_R
-    accepted_positions = []
-    accepted_count = 0
-    while accepted_count < num_samples:
-        candidates = torch.randn(max(2 * (num_samples - accepted_count), 16), 2) * defender_position_std
-        inside_domain = (
-            (candidates[:, 0] >= lower[4]) & (candidates[:, 0] <= upper[4]) &
-            (candidates[:, 1] >= lower[6]) & (candidates[:, 1] <= upper[6]))
-        outside_exclusion = torch.linalg.vector_norm(candidates, dim=-1) > exclusion_radius
-        accepted = candidates[inside_domain & outside_exclusion]
-        accepted_positions.append(accepted)
-        accepted_count += accepted.shape[0]
-    defender_positions = torch.cat(accepted_positions, dim=0)[:num_samples]
-    states[:, 4] = defender_positions[:, 0]
-    states[:, 6] = defender_positions[:, 1]
-    states[:, 1] = torch.empty(num_samples).uniform_(lower[1].item(), upper[1].item())
-    states[:, 3] = torch.empty(num_samples).uniform_(lower[3].item(), upper[3].item())
-    states[:, [5, 7]] = 0.0
-    return states
 
 class Experiment(ABC):
     def __init__(self, model, dataset, experiment_dir, use_wandb):
@@ -168,7 +111,9 @@ class Experiment(ABC):
             self, device, mpc_configs, num_initial_states, replay_buffer,
             optimized_player, generator=None, initial_guess='zero',
             state_distribution='uniform', defender_position_std=0.5,
-            attacker_boundary_std=0.2):
+            attacker_boundary_std=0.2, attacker_velocity='uniform',
+            attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
+            time_distribution='uniform'):
         """Generate BRAT MPC labels against the current policy and add bootstrapped trajectory suffixes to `replay_buffer`."""
         dynamics = self.dataset.dynamics
         required_methods = ('reach_fn', 'avoid_fn', 'optimal_control', 'optimal_disturbance')
@@ -182,10 +127,11 @@ class Experiment(ABC):
         self.model.eval()
         self.model.requires_grad_(False)
 
-        times = self.dataset._sample_times(num_initial_states).squeeze(-1).to(device)
+        times = sample_mpc_initial_times(self.dataset, num_initial_states, time_distribution).to(device)
         real_states = sample_mpc_initial_states(
             dynamics, num_initial_states, state_distribution,
-            defender_position_std, attacker_boundary_std).to(device)
+            defender_position_std, attacker_boundary_std, attacker_velocity,
+            attacker_velocity_spread_deg, attacker_speed_max).to(device)
 
         responder = NeuralBangBangController(model=self.model, dynamics=dynamics, device=device)
         if initial_guess not in ('network', 'zero'):
@@ -387,6 +333,8 @@ class Experiment(ABC):
             mpc_refresh_epochs=1000, mpc_batch_size=1000,
             mpc_state_distribution='interception', mpc_defender_position_std=0.5,
             mpc_attacker_boundary_std=0.2, mpc_reset_replay=False,
+            mpc_attacker_velocity='uniform', mpc_attacker_velocity_spread_deg=60.0,
+            mpc_attacker_speed_max=None, mpc_time_distribution='uniform',
             mpc_loss_weight=1.0, mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
         ):
@@ -498,7 +446,9 @@ class Experiment(ABC):
                             device, mpc_config, mpc_num_initial_states,
                             mpc_replay_buffer, optimized_player, mpc_generator,
                             mpc_initial_guess, mpc_state_distribution,
-                            mpc_defender_position_std, mpc_attacker_boundary_std)
+                            mpc_defender_position_std, mpc_attacker_boundary_std,
+                            mpc_attacker_velocity, mpc_attacker_velocity_spread_deg,
+                            mpc_attacker_speed_max, mpc_time_distribution)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)

@@ -132,9 +132,13 @@ class Dynamics(ABC):
 
 class CrazyflieInterception(Dynamics):
     def __init__(self, target_R:float, capture_R:float,       # <-- type annotations added
-                 accel_max_a:float, accel_max_d:float):
+                 accel_max_a:float, accel_max_d:float,
+                 defender_exclusion_R:float=None):
         self.target_R = target_R
         self.capture_R = capture_R
+        # radius around the target the defender may not enter; defaults to target_R + capture_R
+        self.defender_exclusion_R = (target_R + capture_R if defender_exclusion_R is None
+                                     else defender_exclusion_R)
         self.accel_max_a = accel_max_a
         self.accel_max_d = accel_max_d
 
@@ -203,7 +207,7 @@ class CrazyflieInterception(Dynamics):
         pos_a = torch.stack([state[..., 0], state[..., 2]], dim=-1)
         pos_d = torch.stack([state[..., 4], state[..., 6]], dim=-1)
         attacker_target_margin = torch.norm(pos_a, dim=-1) - self.target_R
-        defender_target_margin = torch.norm(pos_d, dim=-1) - (self.target_R + self.capture_R)
+        defender_target_margin = torch.norm(pos_d, dim=-1) - self.defender_exclusion_R
         return torch.minimum(attacker_target_margin, defender_target_margin)
 
     def avoid_fn(self, state):
@@ -212,7 +216,7 @@ class CrazyflieInterception(Dynamics):
                                state[..., 2] - state[..., 6]], dim=-1)
         pos_d = torch.stack([state[..., 4], state[..., 6]], dim=-1)
         capture_margin = torch.norm(rel_pos, dim=-1) - self.capture_R
-        defender_target_margin = torch.norm(pos_d, dim=-1) - (self.target_R + self.capture_R)
+        defender_target_margin = torch.norm(pos_d, dim=-1) - self.defender_exclusion_R
         return torch.maximum(capture_margin, -defender_target_margin)
 
     def boundary_fn(self, state):

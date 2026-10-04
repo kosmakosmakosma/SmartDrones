@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 import torch
@@ -691,3 +691,97 @@ def optimize_joint_sequences(
 def shift_control_sequence(sequence):
     """Receding-horizon warm start: drop the first action, repeat the final action."""
     return torch.cat((sequence[..., 1:, :], sequence[..., -1:, :]), dim=-2)
+
+
+def closed_loop_rollout(
+    initial_states, initial_times, nominal_controls, nominal_disturbances,
+    responder: NeuralBangBangController, dynamics,
+    attacker_config: MPCConfig, defender_config: MPCConfig, optimized_player="joint",
+    replan_every: int = 1,
+    generator: Optional[torch.Generator] = None,
+    terminal_value_fn: Optional[Callable] = None,
+    use_network_terminal_value: bool = False,
+) -> MPCResult:
+    """Receding-horizon rollout: re-optimise every `replan_every` steps from the state actually reached.
+
+    optimized_player selects who plans with MPC ('attacker', 'defender' or 'joint'); a player that is
+    not optimised reacts to the current state with the responder's bang-bang policy at every step.
+    The planning horizon shrinks so every plan ends at the same final step, hence replan_every equal
+    to the horizon reproduces the corresponding open-loop optimisation exactly.
+    Returns the executed trajectory, labelled with the reach-avoid recursion over it.
+    """
+    if optimized_player not in ("attacker", "defender", "joint"):
+        raise ValueError("optimized_player must be 'attacker', 'defender', or 'joint'")
+    if replan_every < 1:
+        raise ValueError("replan_every must be >= 1")
+    config = attacker_config if optimized_player != "defender" else defender_config
+    horizon_steps, dt = config.horizon_steps, config.dt
+    if optimized_player == "joint" and (defender_config.horizon_steps != horizon_steps or defender_config.dt != dt):
+        raise ValueError("attacker and defender configs must share dt and horizon")
+
+    batch_size, state_dim = initial_states.shape
+    device, dtype = initial_states.device, initial_states.dtype
+    current_times = torch.as_tensor(initial_times, dtype=dtype, device=device).reshape(-1).expand(batch_size).clone()
+    current_states = initial_states.clone()
+    states = torch.zeros(batch_size, horizon_steps + 1, state_dim, device=device, dtype=dtype)
+    controls = torch.zeros(batch_size, horizon_steps, dynamics.control_dim, device=device, dtype=dtype)
+    disturbances = torch.zeros(batch_size, horizon_steps, dynamics.disturbance_dim, device=device, dtype=dtype)
+    times = torch.zeros(batch_size, horizon_steps + 1, device=device, dtype=dtype)
+    states[:, 0], times[:, 0] = current_states, current_times
+
+    plan_u, plan_d = nominal_controls, nominal_disturbances
+    plan_start = 0
+    for step in range(horizon_steps):
+        offset = step - plan_start
+        if step % replan_every == 0:
+            steps_left = horizon_steps - step
+            if offset:   # receding-horizon warm start: drop executed actions, keep the plan length
+                if plan_u is not None:
+                    plan_u = plan_u[:, offset:offset + steps_left]
+                if plan_d is not None:
+                    plan_d = plan_d[:, offset:offset + steps_left]
+            attacker_now = replace(attacker_config, horizon_steps=steps_left)
+            defender_now = replace(defender_config, horizon_steps=steps_left)
+            if optimized_player == "joint":
+                result = optimize_joint_sequences(
+                    current_states, current_times, plan_u, plan_d, responder, dynamics,
+                    attacker_now, defender_now, generator, terminal_value_fn, use_network_terminal_value)
+                plan_u, plan_d = result.controls, result.defender_controls
+            elif optimized_player == "attacker":
+                plan_u = optimize_control_sequence(
+                    current_states, current_times, plan_u, responder, dynamics, attacker_now,
+                    generator, terminal_value_fn, use_network_terminal_value).controls
+            else:
+                plan_d = optimize_disturbance_sequence(
+                    current_states, current_times, plan_d, responder, dynamics, defender_now,
+                    generator, terminal_value_fn, use_network_terminal_value).defender_controls
+            plan_start, offset = step, 0
+
+        if optimized_player == "joint":
+            u, d = plan_u[:, offset], plan_d[:, offset]
+        else:
+            query = responder.query(current_states, current_times)
+            u = plan_u[:, offset] if optimized_player == "attacker" else query.controls
+            d = plan_d[:, offset] if optimized_player == "defender" else query.disturbances
+
+        next_states = integrate_step(dynamics, current_states, u, d, dt, config.integration_method).detach()
+        active = current_times > 0
+        current_states = torch.where(active.unsqueeze(-1), next_states, current_states)
+        current_times = torch.clamp(current_times - dt, min=0.0)
+        states[:, step + 1], times[:, step + 1] = current_states, current_times
+        controls[:, step], disturbances[:, step] = u, d
+
+    final_values = responder.query(current_states, current_times).values
+    terminal_values = None
+    if terminal_value_fn is not None:
+        terminal_values = terminal_value_fn(current_states, current_times)
+    elif use_network_terminal_value:
+        terminal_values = final_values
+    suffix_values = reach_avoid_suffix_values(dynamics, states, terminal_values)
+    network_values = torch.zeros(batch_size, horizon_steps + 1, device=device, dtype=dtype)
+    network_values[:, -1] = final_values
+    return MPCResult(
+        controls=controls, states=states, defender_controls=disturbances,
+        network_values=network_values, suffix_values=suffix_values,
+        score=suffix_values[:, 0], all_scores=suffix_values[:, :1],
+    )

@@ -388,3 +388,54 @@ def test_shift_control_sequence():
     shifted = shift_control_sequence(sequence)
     expected = torch.tensor([[[2.0, 2.0], [3.0, 3.0], [3.0, 3.0]]])
     assert torch.equal(shifted, expected)
+
+
+def _closed_loop_setup(horizon_steps=12):
+    from dynamics.dynamics import CrazyflieInterception
+    from utils.benchmark_mpc import BoundaryResponder, make_config
+    from utils.mpc_data import sample_mpc_initial_states
+    torch.manual_seed(0)
+    dynamics = CrazyflieInterception(0.25, 0.2, 5.0, 7.0, defender_exclusion_R=0.15)
+    responder = BoundaryResponder(dynamics)
+    states = sample_mpc_initial_states(dynamics, 6, 'interception', attacker_velocity='inward')
+    times = torch.full((6,), horizon_steps * 0.02)
+    common = dict(dt=0.02, horizon_steps=horizon_steps, num_samples=8, num_iterations=2,
+                  noise_fraction=0.25, hold_steps=3, chunk=None)
+    configs = make_config(5.0, **common), make_config(7.0, **common)
+    query = responder.query(states, times)
+    nominal_u = query.controls[:, None].expand(-1, horizon_steps, -1).clone()
+    nominal_d = query.disturbances[:, None].expand(-1, horizon_steps, -1).clone()
+    return dynamics, responder, states, times, configs, nominal_u, nominal_d
+
+
+def test_closed_loop_with_single_plan_matches_open_loop():
+    from controllers.mpc import closed_loop_rollout, optimize_joint_sequences
+    dynamics, responder, states, times, (att, dfn), nominal_u, nominal_d = _closed_loop_setup()
+    open_loop = optimize_joint_sequences(
+        states, times, nominal_u, nominal_d, responder, dynamics, att, dfn,
+        generator=torch.Generator().manual_seed(3), use_network_terminal_value=True)
+    closed_loop = closed_loop_rollout(
+        states, times, nominal_u, nominal_d, responder, dynamics, att, dfn, 'joint',
+        replan_every=att.horizon_steps, generator=torch.Generator().manual_seed(3),
+        use_network_terminal_value=True)
+    assert torch.allclose(closed_loop.states, open_loop.states, atol=1e-6)
+    assert torch.allclose(closed_loop.suffix_values, open_loop.suffix_values, atol=1e-6)
+
+
+def test_closed_loop_replanning_follows_dynamics_and_labels_executed_path():
+    from controllers.mpc import closed_loop_rollout, integrate_step, reach_avoid_suffix_values
+    dynamics, responder, states, times, (att, dfn), nominal_u, nominal_d = _closed_loop_setup()
+    for player in ('joint', 'attacker', 'defender'):
+        result = closed_loop_rollout(
+            states, times, nominal_u, nominal_d, responder, dynamics, att, dfn, player,
+            replan_every=2, generator=torch.Generator().manual_seed(4), use_network_terminal_value=True)
+        assert result.states.shape == (6, att.horizon_steps + 1, 8)
+        for step in range(att.horizon_steps):
+            expected = integrate_step(dynamics, result.states[:, step], result.controls[:, step],
+                                      result.defender_controls[:, step], att.dt, att.integration_method)
+            assert torch.allclose(result.states[:, step + 1], expected, atol=1e-5)
+        terminal = responder.query(result.states[:, -1], torch.zeros(6)).values
+        assert torch.allclose(result.suffix_values,
+                              reach_avoid_suffix_values(dynamics, result.states, terminal), atol=1e-6)
+        assert torch.all(result.controls.abs() <= 5.0 + 1e-6)
+        assert torch.all(result.defender_controls.abs() <= 7.0 + 1e-6)

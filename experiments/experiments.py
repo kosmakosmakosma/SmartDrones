@@ -23,7 +23,7 @@ from sklearn import svm
 from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
-from controllers.mpc import optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences
+from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences
 from utils.mpc_data import sample_mpc_initial_states, sample_mpc_initial_times
 
 
@@ -113,7 +113,7 @@ class Experiment(ABC):
             state_distribution='uniform', defender_position_std=0.5,
             attacker_boundary_std=0.2, attacker_velocity='uniform',
             attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
-            time_distribution='uniform'):
+            time_distribution='uniform', rollout='open_loop', replan_every=1):
         """Generate BRAT MPC labels against the current policy and add bootstrapped trajectory suffixes to `replay_buffer`."""
         dynamics = self.dataset.dynamics
         required_methods = ('reach_fn', 'avoid_fn', 'optimal_control', 'optimal_disturbance')
@@ -144,7 +144,24 @@ class Experiment(ABC):
                     num_initial_states, horizon_steps, action_dim).clone()
             return torch.zeros(num_initial_states, horizon_steps, action_dim, device=device)
 
-        if optimized_player == 'attacker':
+        if rollout not in ('open_loop', 'closed_loop'):
+            raise ValueError("rollout must be 'open_loop' or 'closed_loop'")
+        if rollout == 'closed_loop':
+            if optimized_player not in ('attacker', 'defender', 'joint'):
+                raise ValueError("optimized_player must be 'attacker', 'defender', or 'joint'")
+            attacker_config = mpc_configs['attacker']
+            defender_config = mpc_configs['defender']
+            result = closed_loop_rollout(
+                real_states, times,
+                initial_sequence(initial_query.controls if initial_query is not None else None,
+                                 attacker_config.horizon_steps, dynamics.control_dim),
+                initial_sequence(initial_query.disturbances if initial_query is not None else None,
+                                 defender_config.horizon_steps, dynamics.disturbance_dim),
+                responder, dynamics, attacker_config, defender_config, optimized_player,
+                replan_every=replan_every, generator=generator, use_network_terminal_value=True,
+            )
+            mpc_config = defender_config if optimized_player == 'defender' else attacker_config
+        elif optimized_player == 'attacker':
             mpc_config = mpc_configs['attacker']
             nominal_sequence = initial_sequence(
                 initial_query.controls if initial_query is not None else None,
@@ -190,8 +207,8 @@ class Experiment(ABC):
             result.suffix_values.reshape(-1).detach().cpu(),
         )
 
-        print('%s MPC dataset refresh: %d initial states, %d labels added, replay buffer size %d' % (
-            optimized_player.capitalize(), num_initial_states, label_times.numel(), len(replay_buffer)))
+        print('%s %s MPC dataset refresh: %d initial states, %d labels added, replay buffer size %d' % (
+            optimized_player.capitalize(), rollout.replace('_', '-'), num_initial_states, label_times.numel(), len(replay_buffer)))
         if self.use_wandb:
             wandb.log({
                 'mpc_replay_buffer_size': len(replay_buffer),
@@ -335,6 +352,7 @@ class Experiment(ABC):
             mpc_attacker_boundary_std=0.2, mpc_reset_replay=False,
             mpc_attacker_velocity='uniform', mpc_attacker_velocity_spread_deg=60.0,
             mpc_attacker_speed_max=None, mpc_time_distribution='uniform',
+            mpc_rollout='open_loop', mpc_replan_every=1,
             mpc_loss_weight=1.0, mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
         ):
@@ -448,7 +466,8 @@ class Experiment(ABC):
                             mpc_initial_guess, mpc_state_distribution,
                             mpc_defender_position_std, mpc_attacker_boundary_std,
                             mpc_attacker_velocity, mpc_attacker_velocity_spread_deg,
-                            mpc_attacker_speed_max, mpc_time_distribution)
+                            mpc_attacker_speed_max, mpc_time_distribution,
+                            mpc_rollout, mpc_replan_every)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)

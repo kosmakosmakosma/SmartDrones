@@ -26,7 +26,7 @@ import time
 import torch
 
 from controllers.bang_bang import BangBangQuery
-from controllers.mpc import MPCConfig, optimize_joint_sequences
+from controllers.mpc import MPCConfig, optimize_joint_sequences, optimize_maxmin_sequences
 from dynamics.dynamics import CrazyflieInterception
 from utils.mpc_data import sample_mpc_initial_states
 
@@ -72,7 +72,8 @@ def best_response(states, times, controls, disturbances, responder, dynamics, st
 
 
 def run_config(states, dynamics, responder, dt, horizon_s, hold_steps, noise_fraction,
-               num_samples, num_iterations, strong_samples, strong_iterations, chunk, seed):
+               num_samples, num_iterations, strong_samples, strong_iterations, chunk, seed,
+               solver='alternating'):
     """Per-state metrics for one configuration and one sampling seed.
 
     The reference best responses use seeds that depend only on `seed`, so every configuration
@@ -89,7 +90,7 @@ def run_config(states, dynamics, responder, dt, horizon_s, hold_steps, noise_fra
                   hold_steps=hold_steps, chunk=chunk)
     generator = torch.Generator().manual_seed(1000 * seed)
     start = time.perf_counter()
-    result = optimize_joint_sequences(
+    result = (optimize_maxmin_sequences if solver == 'maxmin' else optimize_joint_sequences)(
         states, times, warm_u, warm_d, responder, dynamics,
         make_config(dynamics.accel_max_a, **common), make_config(dynamics.accel_max_d, **common),
         generator=generator, use_network_terminal_value=True)

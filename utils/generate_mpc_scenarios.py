@@ -17,7 +17,7 @@ import pickle
 import torch
 
 from controllers.bang_bang import NeuralBangBangController
-from controllers.mpc import MPCConfig, closed_loop_rollout, optimize_joint_sequences
+from controllers.mpc import MPCConfig, closed_loop_rollout, optimize_joint_sequences, optimize_maxmin_sequences
 from dynamics import dynamics as dynamics_module
 from utils.mpc_data import mpc_domain_constraint, sample_mpc_initial_states
 
@@ -55,6 +55,12 @@ def main():
     parser.add_argument('--experiments_dir', default='./runs')
     parser.add_argument('--experiment_name', default=None, help='Trained experiment providing the network')
     parser.add_argument('--checkpoint', type=int, default=-1, help='-1 for model_final.pth, else epoch number')
+    parser.add_argument('--no_network', action='store_true',
+                        help='Joint MPC without any network: zero initial plans, terminal-set margin as terminal value '
+                             '(an experiment is still used for its dynamics parameters and tMax if given)')
+    parser.add_argument('--game_solver', default='maxmin', choices=['maxmin', 'alternating'],
+                        help="'maxmin': each player keeps its best worst-case plan over all plan pairs; "
+                             "'alternating': best response to the opponent's current plan")
     parser.add_argument('--stand_in', action='store_true',
                         help='Use boundary_fn instead of a trained network (no experiment needed)')
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -83,7 +89,11 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
-    if args.stand_in:
+    if args.no_network and args.experiment_name is None:
+        dynamics = dynamics_module.CrazyflieInterception(
+            0.25, 0.2, 5.0, 7.0, defender_exclusion_R=args.defender_exclusion_R)
+        responder, t_max, device = None, 1.0, 'cpu'
+    elif args.stand_in:
         from utils.benchmark_mpc import BoundaryResponder
         dynamics = dynamics_module.CrazyflieInterception(
             0.25, 0.2, 5.0, 7.0, defender_exclusion_R=args.defender_exclusion_R)
@@ -94,6 +104,10 @@ def main():
         device = args.device
         dynamics, responder, t_max = load_experiment(
             args.experiments_dir, args.experiment_name, args.checkpoint, device, args.defender_exclusion_R)
+    if args.no_network:
+        responder = None
+        if args.optimized_player != 'joint':
+            parser.error('--no_network requires --optimized_player joint')
     t_max = args.tMax if args.tMax is not None else t_max
     if args.horizon_steps * args.dt < t_max - 1e-9:
         print('Warning: horizon %.2fs is shorter than time-to-go %.2fs; the network value closes the tail'
@@ -115,7 +129,7 @@ def main():
     attacker_config = config(dynamics.accel_max_a, dynamics.control_dim, 'attacker')
     defender_config = config(dynamics.accel_max_d, dynamics.disturbance_dim, 'defender')
 
-    if args.initial_guess == 'network':
+    if args.initial_guess == 'network' and responder is not None:
         query = responder.query(states, times)
         nominal_u = query.controls[:, None].expand(-1, args.horizon_steps, -1).clone()
         nominal_d = query.disturbances[:, None].expand(-1, args.horizon_steps, -1).clone()
@@ -128,18 +142,20 @@ def main():
         result = closed_loop_rollout(
             states, times, nominal_u, nominal_d, responder, dynamics, attacker_config, defender_config,
             args.optimized_player, replan_every=args.replan_every, generator=generator,
-            use_network_terminal_value=True, end_on_event=args.end_on_event)
+            use_network_terminal_value=responder is not None, end_on_event=args.end_on_event,
+            game_solver=args.game_solver)
     elif args.optimized_player == 'joint':
-        result = optimize_joint_sequences(
+        solver = optimize_maxmin_sequences if args.game_solver == 'maxmin' else optimize_joint_sequences
+        result = solver(
             states, times, nominal_u, nominal_d, responder, dynamics, attacker_config, defender_config,
-            generator=generator, use_network_terminal_value=True)
+            generator=generator, use_network_terminal_value=responder is not None)
     else:
         parser.error("open_loop is only supported here for --optimized_player joint")
 
     steps = result.states.shape[1]
     label_times = torch.stack([torch.clamp(times - k * args.dt, min=0.0) for k in range(steps)], dim=1)
     torch.save({
-        'epoch': args.checkpoint if not args.stand_in else -1,
+        'epoch': -1 if (args.stand_in or args.no_network) else args.checkpoint,
         'mpc_replay_buffer': {
             'times': label_times.reshape(-1).cpu(),
             'states': result.states.reshape(-1, dynamics.state_dim).cpu(),

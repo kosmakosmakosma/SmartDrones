@@ -23,7 +23,7 @@ from sklearn import svm
 from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
-from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences
+from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences, optimize_maxmin_sequences
 from utils.mpc_data import sample_mpc_initial_states, sample_mpc_initial_times
 
 
@@ -114,7 +114,7 @@ class Experiment(ABC):
             attacker_boundary_std=0.2, attacker_velocity='uniform',
             attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
             time_distribution='uniform', rollout='open_loop', replan_every=1,
-            end_on_event=False):
+            end_on_event=False, game_solver='alternating', use_network=True):
         """Generate BRAT MPC labels against the current policy and add bootstrapped trajectory suffixes to `replay_buffer`."""
         dynamics = self.dataset.dynamics
         required_methods = ('reach_fn', 'avoid_fn', 'optimal_control', 'optimal_disturbance')
@@ -134,10 +134,16 @@ class Experiment(ABC):
             defender_position_std, attacker_boundary_std, attacker_velocity,
             attacker_velocity_spread_deg, attacker_speed_max).to(device)
 
-        responder = NeuralBangBangController(model=self.model, dynamics=dynamics, device=device)
         if initial_guess not in ('network', 'zero'):
             raise ValueError("initial_guess must be 'network' or 'zero'")
-        initial_query = responder.query(real_states, times) if initial_guess == 'network' else None
+        if game_solver not in ('alternating', 'maxmin'):
+            raise ValueError("game_solver must be 'alternating' or 'maxmin'")
+        if not use_network and optimized_player != 'joint':
+            raise ValueError('MPC without the network requires optimized_player=joint')
+        responder = (NeuralBangBangController(model=self.model, dynamics=dynamics, device=device)
+                     if use_network else None)
+        initial_query = (responder.query(real_states, times)
+                         if use_network and initial_guess == 'network' else None)
 
         def initial_sequence(network_actions, horizon_steps, action_dim):
             if network_actions is not None:
@@ -159,8 +165,8 @@ class Experiment(ABC):
                 initial_sequence(initial_query.disturbances if initial_query is not None else None,
                                  defender_config.horizon_steps, dynamics.disturbance_dim),
                 responder, dynamics, attacker_config, defender_config, optimized_player,
-                replan_every=replan_every, generator=generator, use_network_terminal_value=True,
-                end_on_event=end_on_event,
+                replan_every=replan_every, generator=generator, use_network_terminal_value=use_network,
+                end_on_event=end_on_event, game_solver=game_solver,
             )
             mpc_config = defender_config if optimized_player == 'defender' else attacker_config
         elif optimized_player == 'attacker':
@@ -190,10 +196,11 @@ class Experiment(ABC):
             nominal_disturbances = initial_sequence(
                 initial_query.disturbances if initial_query is not None else None,
                 defender_config.horizon_steps, dynamics.disturbance_dim)
-            result = optimize_joint_sequences(
+            solver = optimize_maxmin_sequences if game_solver == 'maxmin' else optimize_joint_sequences
+            result = solver(
                 real_states, times, nominal_controls, nominal_disturbances,
                 responder, dynamics, attacker_config, defender_config,
-                generator=generator, use_network_terminal_value=True,
+                generator=generator, use_network_terminal_value=use_network,
             )
             mpc_config = attacker_config
         else:
@@ -359,6 +366,7 @@ class Experiment(ABC):
             mpc_attacker_velocity='uniform', mpc_attacker_velocity_spread_deg=60.0,
             mpc_attacker_speed_max=None, mpc_time_distribution='uniform',
             mpc_rollout='open_loop', mpc_replan_every=1, mpc_end_on_event=False,
+            mpc_game_solver='alternating', mpc_use_network=True,
             mpc_loss_weight=1.0, mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
         ):
@@ -473,7 +481,8 @@ class Experiment(ABC):
                             mpc_defender_position_std, mpc_attacker_boundary_std,
                             mpc_attacker_velocity, mpc_attacker_velocity_spread_deg,
                             mpc_attacker_speed_max, mpc_time_distribution,
-                            mpc_rollout, mpc_replan_every, mpc_end_on_event)
+                            mpc_rollout, mpc_replan_every, mpc_end_on_event,
+                            mpc_game_solver, mpc_use_network)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)

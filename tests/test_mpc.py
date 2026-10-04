@@ -494,3 +494,44 @@ def test_domain_constraint_rejects_candidates_leaving_the_domain():
     result = optimize_control_sequence(infeasible, times, outward, responder, dynamics, config,
                                        generator=torch.Generator().manual_seed(0))
     assert 0.5 < domain_violation(dynamics, config, result.states[:, None])[0, 0] < 0.6
+
+
+def test_maxmin_picks_best_worst_case_plans_from_full_table():
+    from controllers.mpc import (evaluate_rollouts, optimize_maxmin_sequences, rollout_joint_sequences,
+                                 sample_control_sequences)
+    dynamics, responder, states, times, (att, dfn), nominal_u, nominal_d = _closed_loop_setup()
+    att = att.__class__(**{**att.__dict__, 'num_iterations': 1, 'num_samples': 6})
+    dfn = dfn.__class__(**{**dfn.__dict__, 'num_iterations': 1, 'num_samples': 5})
+    result = optimize_maxmin_sequences(states, times, nominal_u, nominal_d, None, dynamics, att, dfn,
+                                       generator=torch.Generator().manual_seed(7))
+
+    generator = torch.Generator().manual_seed(7)   # regenerate the same candidates
+    U = sample_control_sequences(nominal_u, 6, att.noise_std, att.control_lower, att.control_upper, generator,
+                                 att.control_hold_steps, att.include_axis_candidates)
+    D = sample_control_sequences(nominal_d, 5, dfn.noise_std, dfn.control_lower, dfn.control_upper, generator,
+                                 dfn.control_hold_steps, dfn.include_axis_candidates)
+    table = torch.zeros(6, 6, 5)
+    for i in range(6):
+        for j in range(5):
+            rollout = rollout_joint_sequences(states, times, U[:, i:i + 1], D[:, j:j + 1], None, dynamics, att.dt)
+            table[:, i, j] = evaluate_rollouts(dynamics, rollout)[0][:, 0]
+    best_i = table.amax(2).argmin(1)
+    best_j = table.amin(1).argmax(1)
+    batch = torch.arange(6)
+    assert torch.equal(result.controls, U[batch, best_i])
+    assert torch.equal(result.defender_controls, D[batch, best_j])
+    assert torch.allclose(result.upper_value, table.amax(2).amin(1))
+    assert torch.allclose(result.lower_value, table.amin(1).amax(1))
+    assert torch.all(result.upper_value >= result.lower_value - 1e-6)   # min-max >= max-min
+
+
+def test_closed_loop_without_network_matches_exact_terminal_value():
+    from controllers.mpc import closed_loop_rollout
+    dynamics, responder, states, times, (att, dfn), nominal_u, nominal_d = _closed_loop_setup()
+    zeros_u, zeros_d = torch.zeros_like(nominal_u), torch.zeros_like(nominal_d)
+    runs = [closed_loop_rollout(states, times, zeros_u, zeros_d, r, dynamics, att, dfn, 'joint', replan_every=3,
+                                generator=torch.Generator().manual_seed(2), use_network_terminal_value=True,
+                                end_on_event=True, game_solver='maxmin')
+            for r in (None, responder)]   # the stand-in's value is boundary_fn, exact at time-to-go 0
+    assert torch.equal(runs[0].states, runs[1].states)
+    assert torch.allclose(runs[0].suffix_values, runs[1].suffix_values)

@@ -67,6 +67,8 @@ class MPCResult:
     score: torch.Tensor             # [B]
     all_scores: torch.Tensor        # [B,N] (final iteration, all candidates)
     event_steps: Optional[torch.Tensor] = None  # [B] first step at which the game ended (H if it never did)
+    upper_value: Optional[torch.Tensor] = None  # [B] max-min solver: attacker's guaranteed score min_i max_j
+    lower_value: Optional[torch.Tensor] = None  # [B] max-min solver: defender's guaranteed score max_j min_i
 
 
 def sample_control_sequences(
@@ -279,9 +281,19 @@ def rollout_disturbance_sequences(
 
 def rollout_joint_sequences(
     initial_states, initial_times, attacker_controls, defender_controls,
-    responder: NeuralBangBangController, dynamics, dt, integration_method="euler",
+    responder: Optional[NeuralBangBangController], dynamics, dt, integration_method="euler",
+    network_values: str = "all",
 ):
-    """Roll out paired attacker and defender sequences with shape [B,N,H,*]."""
+    """Roll out paired attacker and defender sequences with shape [B,N,H,*].
+
+    Both players follow their sequences, so the network is only needed for recorded values:
+    network_values='all' queries it at every step, 'final' only at the last state (the terminal
+    value), 'none' never (values stay 0; also used when responder is None).
+    """
+    if network_values not in ("all", "final", "none"):
+        raise ValueError("network_values must be 'all', 'final' or 'none'")
+    if responder is None:
+        network_values = "none"
     if initial_states.ndim != 2:
         raise ValueError("initial_states must have shape [B,S]")
     if attacker_controls.ndim != 4 or defender_controls.ndim != 4:
@@ -305,7 +317,7 @@ def rollout_joint_sequences(
         raise ValueError("initial_times must be scalar or one value per batch element")
 
     states = torch.zeros(batch_size, num_candidates, horizon_steps + 1, state_dim, device=device, dtype=dtype)
-    network_values = torch.zeros(batch_size, num_candidates, horizon_steps + 1, device=device, dtype=dtype)
+    values = torch.zeros(batch_size, num_candidates, horizon_steps + 1, device=device, dtype=dtype)
     times = torch.zeros(batch_size, num_candidates, horizon_steps + 1, device=device, dtype=dtype)
     valid_steps = torch.zeros(batch_size, num_candidates, horizon_steps, dtype=torch.bool, device=device)
 
@@ -317,8 +329,9 @@ def rollout_joint_sequences(
     for step in range(horizon_steps):
         flat_states = current_states.reshape(batch_size * num_candidates, state_dim)
         flat_times = current_times.reshape(batch_size * num_candidates)
-        query = responder.query(flat_states, flat_times)
-        network_values[:, :, step] = query.values.reshape(batch_size, num_candidates)
+        if network_values == "all":
+            query = responder.query(flat_states, flat_times)
+            values[:, :, step] = query.values.reshape(batch_size, num_candidates)
 
         next_flat_states = integrate_step(
             dynamics,
@@ -337,17 +350,18 @@ def rollout_joint_sequences(
         times[:, :, step + 1] = current_times
         valid_steps[:, :, step] = active
 
-    final_query = responder.query(
-        current_states.reshape(batch_size * num_candidates, state_dim),
-        current_times.reshape(batch_size * num_candidates),
-    )
-    network_values[:, :, horizon_steps] = final_query.values.reshape(batch_size, num_candidates)
+    if network_values != "none":
+        final_query = responder.query(
+            current_states.reshape(batch_size * num_candidates, state_dim),
+            current_times.reshape(batch_size * num_candidates),
+        )
+        values[:, :, horizon_steps] = final_query.values.reshape(batch_size, num_candidates)
 
     return MPCRollout(
         states=states,
         attacker_controls=attacker_controls,
         defender_controls=defender_controls,
-        network_values=network_values,
+        network_values=values,
         times=times,
         valid_steps=valid_steps,
     )
@@ -628,6 +642,9 @@ def optimize_joint_sequences(
     best = None
     best_score = None
     batch_size = initial_states.shape[0]
+    # Both players follow sequences here, so the network only matters for the terminal value.
+    query_mode = "final" if (use_network_terminal_value and terminal_value_fn is None) else "none"
+    initial_values = None if responder is None else responder.query(initial_states, initial_times).values
 
     for _ in range(attacker_config.num_iterations):
         attacker_candidates = sample_control_sequences(
@@ -647,13 +664,15 @@ def optimize_joint_sequences(
                 batch_size, end - start, defender_config.horizon_steps, dynamics.disturbance_dim)
             rollout = rollout_joint_sequences(
                 initial_states, initial_times, chunk_controls, chunk_disturbances,
-                responder, dynamics, attacker_config.dt, attacker_config.integration_method,
+                responder, dynamics, attacker_config.dt, attacker_config.integration_method, query_mode,
             )
+            if initial_values is not None:
+                rollout.network_values[:, :, 0] = initial_values[:, None]
             terminal_values = None
             if terminal_value_fn is not None:
                 terminal_values = terminal_value_fn(rollout.states[:, :, -1], rollout.times[:, :, -1])
             elif use_network_terminal_value:
-                terminal_values = rollout.network_values[:, :, -1]
+                terminal_values = rollout.network_values[:, :, -1] if responder is not None else None
             scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal_values)
             chunk_best_score, chunk_best = _select_best_candidate(_selection_scores(dynamics, attacker_config, rollout.states, scores, False), {
                 "score": scores,
@@ -689,13 +708,15 @@ def optimize_joint_sequences(
                 batch_size, end - start, attacker_config.horizon_steps, dynamics.control_dim)
             rollout = rollout_joint_sequences(
                 initial_states, initial_times, chunk_controls, chunk_disturbances,
-                responder, dynamics, defender_config.dt, defender_config.integration_method,
+                responder, dynamics, defender_config.dt, defender_config.integration_method, query_mode,
             )
+            if initial_values is not None:
+                rollout.network_values[:, :, 0] = initial_values[:, None]
             terminal_values = None
             if terminal_value_fn is not None:
                 terminal_values = terminal_value_fn(rollout.states[:, :, -1], rollout.times[:, :, -1])
             elif use_network_terminal_value:
-                terminal_values = rollout.network_values[:, :, -1]
+                terminal_values = rollout.network_values[:, :, -1] if responder is not None else None
             scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal_values)
             chunk_scores.append(scores)
             chunk_best_score, chunk_best = _select_best_candidate(_selection_scores(dynamics, defender_config, rollout.states, scores, True), {
@@ -728,6 +749,112 @@ def optimize_joint_sequences(
     )
 
 
+def _violation_penalty(violation):
+    return torch.where(violation > 0, DOMAIN_PENALTY + violation, torch.zeros_like(violation))
+
+
+def optimize_maxmin_sequences(
+    initial_states, initial_times, nominal_controls, nominal_disturbances,
+    responder: Optional[NeuralBangBangController], dynamics,
+    attacker_config: MPCConfig, defender_config: MPCConfig,
+    generator: Optional[torch.Generator] = None,
+    terminal_value_fn: Optional[Callable] = None,
+    use_network_terminal_value: bool = False,
+) -> MPCResult:
+    """Robust game MPC over the full table of attacker x defender candidate plans.
+
+    Each iteration samples attacker and defender plans around the current ones, rolls out every
+    pair and builds the score table M[b, i, j]. The attacker keeps the plan with the best worst
+    case, argmin_i max_j M[i, j]; the defender keeps argmax_j min_i M[i, j]. A candidate whose own
+    drone leaves its domain ranks last for its owner and is not used as a counterplay by the other
+    player (unless no candidate of that player is valid).
+    attacker_config.candidate_chunk_size sets how many attacker plans are rolled out against all
+    defender plans at once (default 8).
+    Returns the rollout of the two chosen plans, with upper_value = min_i max_j M (what the attacker
+    guarantees) and lower_value = max_j min_i M (what the defender guarantees) from the last table.
+    """
+    if initial_states.ndim != 2:
+        raise ValueError("initial_states must have shape [B,S]")
+    compatible_fields = ("dt", "horizon_steps", "num_iterations", "integration_method")
+    if any(getattr(attacker_config, field) != getattr(defender_config, field) for field in compatible_fields):
+        raise ValueError("attacker and defender configs must share dt, horizon, iterations, and integrator")
+
+    batch_size = initial_states.shape[0]
+    horizon_steps = attacker_config.horizon_steps
+    num_attacker, num_defender = attacker_config.num_samples, defender_config.num_samples
+    rows_per_chunk = attacker_config.candidate_chunk_size or min(num_attacker, 8)
+    use_network = use_network_terminal_value and terminal_value_fn is None and responder is not None
+    query_mode = "final" if use_network else "none"
+    batch_index = torch.arange(batch_size, device=initial_states.device)
+
+    def terminal(rollout):
+        if terminal_value_fn is not None:
+            return terminal_value_fn(rollout.states[:, :, -1], rollout.times[:, :, -1])
+        return rollout.network_values[:, :, -1] if use_network else None
+
+    attacker_plan, defender_plan = nominal_controls, nominal_disturbances
+    for _ in range(attacker_config.num_iterations):
+        attacker_candidates = sample_control_sequences(
+            attacker_plan, num_attacker, attacker_config.noise_std,
+            attacker_config.control_lower, attacker_config.control_upper, generator=generator,
+            control_hold_steps=attacker_config.control_hold_steps,
+            include_axis_candidates=attacker_config.include_axis_candidates)
+        defender_candidates = sample_control_sequences(
+            defender_plan, num_defender, defender_config.noise_std,
+            defender_config.control_lower, defender_config.control_upper, generator=generator,
+            control_hold_steps=defender_config.control_hold_steps,
+            include_axis_candidates=defender_config.include_axis_candidates)
+
+        table, attacker_violation, defender_violation = [], [], []
+        for start in range(0, num_attacker, rows_per_chunk):
+            end = min(start + rows_per_chunk, num_attacker)
+            rows = end - start
+            pair_controls = attacker_candidates[:, start:end, None].expand(
+                batch_size, rows, num_defender, horizon_steps, dynamics.control_dim
+            ).reshape(batch_size, rows * num_defender, horizon_steps, dynamics.control_dim)
+            pair_disturbances = defender_candidates[:, None].expand(
+                batch_size, rows, num_defender, horizon_steps, dynamics.disturbance_dim
+            ).reshape(batch_size, rows * num_defender, horizon_steps, dynamics.disturbance_dim)
+            rollout = rollout_joint_sequences(
+                initial_states, initial_times, pair_controls, pair_disturbances, responder, dynamics,
+                attacker_config.dt, attacker_config.integration_method, query_mode)
+            scores, _ = evaluate_rollouts(dynamics, rollout, terminal(rollout))
+            table.append(scores.view(batch_size, rows, num_defender))
+            for violations, config in ((attacker_violation, attacker_config), (defender_violation, defender_config)):
+                violation = domain_violation(dynamics, config, rollout.states)
+                violations.append(torch.zeros_like(scores) if violation is None else violation)
+                violations[-1] = violations[-1].view(batch_size, rows, num_defender)
+
+        table = torch.cat(table, dim=1)                                           # [B, Na, Nd]
+        attacker_violation = torch.cat(attacker_violation, dim=1).amax(dim=2)     # [B, Na]
+        defender_violation = torch.cat(defender_violation, dim=1).amax(dim=1)     # [B, Nd]
+        attacker_valid, defender_valid = attacker_violation <= 0, defender_violation <= 0
+        attacker_valid = attacker_valid | ~attacker_valid.any(dim=1, keepdim=True)
+        defender_valid = defender_valid | ~defender_valid.any(dim=1, keepdim=True)
+
+        attacker_worst = table.masked_fill(~defender_valid[:, None, :], float("-inf")).amax(dim=2)  # [B, Na]
+        defender_worst = table.masked_fill(~attacker_valid[:, :, None], float("inf")).amin(dim=1)   # [B, Nd]
+        best_attacker = (attacker_worst + _violation_penalty(attacker_violation)).argmin(dim=1)
+        best_defender = (defender_worst - _violation_penalty(defender_violation)).argmax(dim=1)
+        attacker_plan = attacker_candidates[batch_index, best_attacker]
+        defender_plan = defender_candidates[batch_index, best_defender]
+        upper_value = attacker_worst[batch_index, best_attacker]
+        lower_value = defender_worst[batch_index, best_defender]
+
+    rollout = rollout_joint_sequences(
+        initial_states, initial_times, attacker_plan[:, None], defender_plan[:, None], responder, dynamics,
+        attacker_config.dt, attacker_config.integration_method, query_mode)
+    if responder is not None:
+        rollout.network_values[:, :, 0] = responder.query(initial_states, initial_times).values[:, None]
+    scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal(rollout))
+    return MPCResult(
+        controls=attacker_plan, states=rollout.states[:, 0], defender_controls=defender_plan,
+        network_values=rollout.network_values[:, 0], suffix_values=suffix_values[:, 0],
+        score=scores[:, 0], all_scores=table.flatten(1),
+        upper_value=upper_value, lower_value=lower_value,
+    )
+
+
 def shift_control_sequence(sequence):
     """Receding-horizon warm start: drop the first action, repeat the final action."""
     return torch.cat((sequence[..., 1:, :], sequence[..., -1:, :]), dim=-2)
@@ -742,6 +869,7 @@ def closed_loop_rollout(
     terminal_value_fn: Optional[Callable] = None,
     use_network_terminal_value: bool = False,
     end_on_event: bool = False,
+    game_solver: str = "alternating",
 ) -> MPCResult:
     """Receding-horizon rollout: re-optimise every `replan_every` steps from the state actually reached.
 
@@ -752,8 +880,15 @@ def closed_loop_rollout(
     With end_on_event, a trajectory stops (its state is frozen) at the first state inside the reach set
     (reach_fn <= 0, e.g. target hit) or the avoid set (avoid_fn <= 0, e.g. capture); its label at that
     state is then max(reach, -avoid) of that state, as if the game ended there.
+    game_solver picks the joint planner: 'alternating' (optimize_joint_sequences) or 'maxmin'
+    (optimize_maxmin_sequences). With optimized_player='joint' the responder may be None: the
+    network is then not used at all and the terminal value is the terminal-set margin.
     Returns the executed trajectory, labelled with the reach-avoid recursion over it.
     """
+    if game_solver not in ("alternating", "maxmin"):
+        raise ValueError("game_solver must be 'alternating' or 'maxmin'")
+    if responder is None and optimized_player != "joint":
+        raise ValueError("a responder is required unless optimized_player is 'joint'")
     if optimized_player not in ("attacker", "defender", "joint"):
         raise ValueError("optimized_player must be 'attacker', 'defender', or 'joint'")
     if replan_every < 1:
@@ -789,7 +924,8 @@ def closed_loop_rollout(
             attacker_now = replace(attacker_config, horizon_steps=steps_left)
             defender_now = replace(defender_config, horizon_steps=steps_left)
             if optimized_player == "joint":
-                result = optimize_joint_sequences(
+                solver = optimize_maxmin_sequences if game_solver == "maxmin" else optimize_joint_sequences
+                result = solver(
                     current_states, current_times, plan_u, plan_d, responder, dynamics,
                     attacker_now, defender_now, generator, terminal_value_fn, use_network_terminal_value)
                 plan_u, plan_d = result.controls, result.defender_controls
@@ -827,11 +963,12 @@ def closed_loop_rollout(
         newly_ended = ~ended & ((dynamics.reach_fn(current_states) <= 0) | (dynamics.avoid_fn(current_states) <= 0))
         ended = ended | newly_ended
 
-    final_values = responder.query(current_states, current_times).values
+    final_values = (torch.zeros(batch_size, device=device, dtype=dtype) if responder is None
+                    else responder.query(current_states, current_times).values)
     terminal_values = None
     if terminal_value_fn is not None:
         terminal_values = terminal_value_fn(current_states, current_times)
-    elif use_network_terminal_value:
+    elif use_network_terminal_value and responder is not None:
         terminal_values = final_values
     if end_on_event:   # a finished game has no future: its value is its terminal-set margin
         boundary = torch.maximum(dynamics.reach_fn(current_states), -dynamics.avoid_fn(current_states))

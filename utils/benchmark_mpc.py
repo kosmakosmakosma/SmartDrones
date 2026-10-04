@@ -182,14 +182,13 @@ def main():
             row['def_kept'] = metrics['def_kept'].mean().item()
             row['att_kept'] = metrics['att_kept'].mean().item()
             rows.append(row)
+            with open(args.output, 'w', newline='') as file:   # rewrite after every row so partial runs keep results
+                writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
             print('%s=%s exploit=%.4f+-%.4f diff=%+.4f+-%.4f att_gap=%.4f def_gap=%.4f seconds=%.2f' % (
                 name, value, row['exploit'], row['exploit_ci'], row['exploit_vs_base'],
                 row['exploit_vs_base_ci'], row['attacker_gap'], row['defender_gap'], seconds), flush=True)
-
-    with open(args.output, 'w', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 if __name__ == '__main__':

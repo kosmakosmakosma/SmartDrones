@@ -461,3 +461,36 @@ def test_closed_loop_ends_at_first_terminal_event():
     boundary = torch.maximum(dynamics.reach_fn(final), -dynamics.avoid_fn(final))
     assert torch.allclose(result.suffix_values[0, event:], boundary.expand(41 - event))
     assert result.score[0] <= 0                       # attacker reached the target
+
+
+def test_domain_constraint_rejects_candidates_leaving_the_domain():
+    from controllers.mpc import MPCConfig, domain_violation, optimize_control_sequence
+    from dynamics.dynamics import CrazyflieInterception
+    from utils.benchmark_mpc import BoundaryResponder
+    from utils.mpc_data import mpc_domain_constraint
+    dynamics = CrazyflieInterception(0.25, 0.2, 5.0, 7.0, defender_exclusion_R=0.15)
+    responder = BoundaryResponder(dynamics)
+    # attacker near the edge flying outward; braking (stop distance 0.4 m) keeps it inside
+    states = torch.tensor([[1.5, 2.0, 0.0, 0.0, -1.5, 0.0, -1.5, 0.0]])
+    times = torch.tensor([0.5])
+    config = MPCConfig(dt=0.02, horizon_steps=25, num_samples=64, num_iterations=3, noise_std=2.0,
+                       control_lower=torch.full((2,), -5.0), control_upper=torch.full((2,), 5.0),
+                       control_hold_steps=5, **mpc_domain_constraint(dynamics, 'attacker', 'state'))
+    outward = torch.tensor([5.0, 0.0]).expand(1, 25, 2).clone()   # keeps accelerating out of the box
+    result = optimize_control_sequence(states, times, outward, responder, dynamics, config,
+                                       generator=torch.Generator().manual_seed(0))
+    assert domain_violation(dynamics, config, result.states[:, None])[0, 0] == 0
+    assert torch.all(result.states[0, :, 0] <= 2.0 + 1e-6)
+
+    unconstrained = optimize_control_sequence(
+        states, times, outward, responder, dynamics,
+        MPCConfig(**{**config.__dict__, 'domain_dims': None, 'domain_lower': None, 'domain_upper': None}),
+        generator=torch.Generator().manual_seed(0))
+    assert torch.allclose(result.score, result.suffix_values[:, 0])   # reported score is not penalised
+    assert unconstrained.states[0, :, 0].max() > 2.0
+
+    # infeasible: from 1.9 m at 2.5 m/s the stop distance is 0.625 m, so the least violation (0.525 m) wins
+    infeasible = torch.tensor([[1.9, 2.5, 0.0, 0.0, -1.5, 0.0, -1.5, 0.0]])
+    result = optimize_control_sequence(infeasible, times, outward, responder, dynamics, config,
+                                       generator=torch.Generator().manual_seed(0))
+    assert 0.5 < domain_violation(dynamics, config, result.states[:, None])[0, 0] < 0.6

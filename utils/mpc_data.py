@@ -141,3 +141,22 @@ def sample_mpc_initial_times(dataset, num_samples, distribution='uniform'):
                 '(set mpc_start_epoch after pretraining and counter_end)')
         return torch.full((num_samples,), float(dataset.tMax))
     raise ValueError("distribution must be 'uniform' or 'tmax'")
+
+
+def mpc_domain_constraint(dynamics, player, mode='position'):
+    """MPCConfig kwargs restricting `player`'s own drone to the training domain (state_mean +- state_var).
+
+    mode: 'none', 'position' (own x/y positions) or 'state' (own positions and velocities).
+    Only defined for the 8D interception state [px_a, vx_a, py_a, vy_a, px_d, vx_d, py_d, vy_d].
+    """
+    if mode == 'none':
+        return {}
+    if mode not in ('position', 'state'):
+        raise ValueError("mode must be 'none', 'position' or 'state'")
+    if dynamics.state_dim != 8:
+        raise ValueError('domain constraint is only defined for the 8D interception dynamics')
+    offset = {'attacker': 0, 'defender': 4}[player]
+    dims = tuple(offset + i for i in ((0, 2) if mode == 'position' else (0, 1, 2, 3)))
+    mean = dynamics.state_mean.to(dtype=torch.float32)
+    var = dynamics.state_var.to(dtype=torch.float32)
+    return dict(domain_dims=dims, domain_lower=(mean - var)[list(dims)], domain_upper=(mean + var)[list(dims)])

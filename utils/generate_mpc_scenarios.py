@@ -19,7 +19,7 @@ import torch
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import MPCConfig, closed_loop_rollout, optimize_joint_sequences
 from dynamics import dynamics as dynamics_module
-from utils.mpc_data import sample_mpc_initial_states
+from utils.mpc_data import mpc_domain_constraint, sample_mpc_initial_states
 
 
 def load_experiment(experiments_dir, experiment_name, checkpoint, device, defender_exclusion_R):
@@ -65,6 +65,8 @@ def main():
     parser.add_argument('--optimized_player', default='joint', choices=['attacker', 'defender', 'joint'])
     parser.add_argument('--rollout', default='closed_loop', choices=['closed_loop', 'open_loop'])
     parser.add_argument('--replan_every', type=int, default=1)
+    parser.add_argument('--domain_constraint', default='state', choices=['none', 'position', 'state'],
+                        help='Reject MPC candidates whose own drone leaves the training domain before the game ends')
     parser.add_argument('--end_on_event', action=argparse.BooleanOptionalAction, default=True,
                         help='Stop each scenario at capture, target hit or exclusion breach (closed loop only)')
     parser.add_argument('--initial_guess', default='network', choices=['network', 'zero'])
@@ -103,14 +105,15 @@ def main():
         args.attacker_boundary_std, args.attacker_velocity).to(device)
     times = torch.full((args.num_initial_states,), float(t_max), device=device)
 
-    def config(bound, dim):
+    def config(bound, dim, player):
         return MPCConfig(
             dt=args.dt, horizon_steps=args.horizon_steps, num_samples=args.num_samples,
             num_iterations=args.iterations, noise_std=args.noise_fraction * bound,
             control_lower=torch.full((dim,), -bound), control_upper=torch.full((dim,), bound),
-            integration_method=args.integrator, control_hold_steps=args.control_hold_steps)
-    attacker_config = config(dynamics.accel_max_a, dynamics.control_dim)
-    defender_config = config(dynamics.accel_max_d, dynamics.disturbance_dim)
+            integration_method=args.integrator, control_hold_steps=args.control_hold_steps,
+            **mpc_domain_constraint(dynamics, player, args.domain_constraint))
+    attacker_config = config(dynamics.accel_max_a, dynamics.control_dim, 'attacker')
+    defender_config = config(dynamics.accel_max_d, dynamics.disturbance_dim, 'defender')
 
     if args.initial_guess == 'network':
         query = responder.query(states, times)

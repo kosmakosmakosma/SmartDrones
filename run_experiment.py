@@ -115,6 +115,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_attacker_speed_max', type=float, default=None, help='Max inward attacker speed in m/s (defaults to the velocity domain bound)')
     p.add_argument('--mpc_rollout', type=str, default='closed_loop', choices=['open_loop', 'closed_loop'], help="'closed_loop' re-plans from the reached state every --mpc_replan_every steps and labels the executed trajectory; 'open_loop' labels the single optimised plan")
     p.add_argument('--mpc_end_on_event', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Closed-loop rollouts stop at capture, target hit or exclusion breach; only states up to that point are labelled')
+    p.add_argument('--mpc_domain_constraint', type=str, default='state', choices=['none', 'position', 'state'], help="Reject MPC candidates whose own drone leaves the training domain before the game ends: 'position' (x/y), 'state' (also velocities) or 'none'")
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
     p.add_argument('--mpc_time_distribution', type=str, default='tmax', choices=['uniform', 'tmax'], help="Time-to-go of MPC initial states: 'tmax' starts every rollout at tMax, 'uniform' follows the training curriculum")
     p.add_argument('--mpc_start_epoch', type=int, default=0, help='First global training epoch at which MPC replay generation is enabled')
@@ -266,7 +267,10 @@ if (mode == 'all') or (mode == 'train'):
     if use_mpc_guidance:
         from controllers.mpc import MPCConfig
         from utils.mpc_data import MPCReplayBuffer
-        def make_mpc_config(control_bound, action_dim):
+        from utils.mpc_data import mpc_domain_constraint
+        domain_mode = getattr(mpc_options, 'mpc_domain_constraint', 'none')
+
+        def make_mpc_config(control_bound, action_dim, player):
             absolute_noise = getattr(mpc_options, 'mpc_noise_std', None)
             noise_fraction = getattr(mpc_options, 'mpc_noise_fraction', 0.25)
             noise_std = (absolute_noise if absolute_noise is not None
@@ -282,11 +286,12 @@ if (mode == 'all') or (mode == 'train'):
                 integration_method=mpc_options.mpc_integrator,
                 candidate_chunk_size=mpc_options.mpc_candidate_chunk_size,
                 control_hold_steps=getattr(mpc_options, 'mpc_control_hold_steps', 10),
+                **mpc_domain_constraint(dynamics, player, domain_mode),
             )
 
         mpc_config = {
-            'attacker': make_mpc_config(dynamics.accel_max_a, dynamics.control_dim),
-            'defender': make_mpc_config(dynamics.accel_max_d, dynamics.disturbance_dim),
+            'attacker': make_mpc_config(dynamics.accel_max_a, dynamics.control_dim, 'attacker'),
+            'defender': make_mpc_config(dynamics.accel_max_d, dynamics.disturbance_dim, 'defender'),
         }
         mpc_replay_buffer = MPCReplayBuffer(
             state_dim=dynamics.state_dim, capacity=mpc_options.mpc_replay_capacity)

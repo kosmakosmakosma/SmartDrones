@@ -19,6 +19,10 @@ class MPCConfig:
     candidate_chunk_size: Optional[int] = None
     control_hold_steps: int = 1
     include_axis_candidates: bool = True
+    # optional box constraint on this player's own state dims: candidates leaving it before the game ends are rejected
+    domain_dims: Optional[tuple] = None
+    domain_lower: Optional[torch.Tensor] = None
+    domain_upper: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         if self.dt <= 0:
@@ -406,6 +410,37 @@ def gather_candidates(tensor, indices):
     return torch.gather(tensor, dim=1, index=index).squeeze(1)
 
 
+DOMAIN_PENALTY = 1e3
+
+
+def domain_violation(dynamics, config: MPCConfig, states):
+    """[...] largest distance by which config.domain_dims leave [domain_lower, domain_upper] before the game ends.
+
+    states: [...,H+1,S]. Steps after the first state inside the reach or avoid set are ignored, since
+    the game is over there. Returns None when the config has no domain constraint.
+    """
+    if config.domain_dims is None:
+        return None
+    dims = list(config.domain_dims)
+    lower = torch.as_tensor(config.domain_lower, dtype=states.dtype, device=states.device)
+    upper = torch.as_tensor(config.domain_upper, dtype=states.dtype, device=states.device)
+    own = states[..., dims]
+    excess = (torch.clamp(own - upper, min=0) + torch.clamp(lower - own, min=0)).amax(dim=-1)
+    ended = ((dynamics.reach_fn(states) <= 0) | (dynamics.avoid_fn(states) <= 0)).int()
+    after_end = (torch.cumsum(ended, dim=-1) - ended) > 0
+    return excess.masked_fill(after_end, 0.0).amax(dim=-1)
+
+
+def _selection_scores(dynamics, config, states, scores, maximize):
+    """Scores used to pick candidates: domain-violating candidates rank below every valid one
+    (least violation first if none is valid). The reported score and labels stay unpenalised."""
+    violation = domain_violation(dynamics, config, states)
+    if violation is None:
+        return scores
+    penalty = torch.where(violation > 0, DOMAIN_PENALTY + violation, torch.zeros_like(violation))
+    return scores - penalty if maximize else scores + penalty
+
+
 def _select_best_candidate(scores, candidate_tensors, maximize=False):
     best_indices = scores.argmax(dim=1) if maximize else scores.argmin(dim=1)
     best_scores = gather_candidates(scores.unsqueeze(-1), best_indices).squeeze(-1)
@@ -465,7 +500,8 @@ def optimize_control_sequence(
             scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal_values)
             chunk_scores.append(scores)
 
-            chunk_best_score, chunk_best = _select_best_candidate(scores, {
+            chunk_best_score, chunk_best = _select_best_candidate(_selection_scores(dynamics, config, rollout.states, scores, False), {
+                "score": scores,
                 "controls": chunk_controls,
                 "states": rollout.states,
                 "defender_controls": rollout.defender_controls,
@@ -490,7 +526,7 @@ def optimize_control_sequence(
         defender_controls=best["defender_controls"],
         network_values=best["network_values"],
         suffix_values=best["suffix_values"],
-        score=best_score,
+        score=best["score"],
         all_scores=all_scores,
     )
 
@@ -539,7 +575,8 @@ def optimize_disturbance_sequence(
 
             scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal_values)
             chunk_scores.append(scores)
-            chunk_best_score, chunk_best = _select_best_candidate(scores, {
+            chunk_best_score, chunk_best = _select_best_candidate(_selection_scores(dynamics, config, rollout.states, scores, True), {
+                "score": scores,
                 "controls": rollout.attacker_controls,
                 "states": rollout.states,
                 "defender_controls": chunk_disturbances,
@@ -564,7 +601,7 @@ def optimize_disturbance_sequence(
         defender_controls=best["defender_controls"],
         network_values=best["network_values"],
         suffix_values=best["suffix_values"],
-        score=best_score,
+        score=best["score"],
         all_scores=all_scores,
     )
 
@@ -618,7 +655,8 @@ def optimize_joint_sequences(
             elif use_network_terminal_value:
                 terminal_values = rollout.network_values[:, :, -1]
             scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal_values)
-            chunk_best_score, chunk_best = _select_best_candidate(scores, {
+            chunk_best_score, chunk_best = _select_best_candidate(_selection_scores(dynamics, attacker_config, rollout.states, scores, False), {
+                "score": scores,
                 "controls": chunk_controls,
                 "states": rollout.states,
                 "defender_controls": chunk_disturbances,
@@ -660,7 +698,8 @@ def optimize_joint_sequences(
                 terminal_values = rollout.network_values[:, :, -1]
             scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal_values)
             chunk_scores.append(scores)
-            chunk_best_score, chunk_best = _select_best_candidate(scores, {
+            chunk_best_score, chunk_best = _select_best_candidate(_selection_scores(dynamics, defender_config, rollout.states, scores, True), {
+                "score": scores,
                 "controls": chunk_controls,
                 "states": rollout.states,
                 "defender_controls": chunk_disturbances,
@@ -684,7 +723,7 @@ def optimize_joint_sequences(
         defender_controls=best["defender_controls"],
         network_values=best["network_values"],
         suffix_values=best["suffix_values"],
-        score=best_score,
+        score=best["score"],
         all_scores=all_scores,
     )
 

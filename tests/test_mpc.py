@@ -535,3 +535,20 @@ def test_closed_loop_without_network_matches_exact_terminal_value():
             for r in (None, responder)]   # the stand-in's value is boundary_fn, exact at time-to-go 0
     assert torch.equal(runs[0].states, runs[1].states)
     assert torch.allclose(runs[0].suffix_values, runs[1].suffix_values)
+
+
+def test_defender_keep_out_rejects_plans_entering_exclusion_zone():
+    from controllers.mpc import MPCConfig, domain_violation
+    from dynamics.dynamics import CrazyflieInterception
+    from utils.mpc_data import mpc_domain_constraint
+    dynamics = CrazyflieInterception(0.25, 0.2, 5.0, 7.0, defender_exclusion_R=0.15)
+    config = MPCConfig(dt=0.02, horizon_steps=2, num_samples=1, num_iterations=1, noise_std=0.1,
+                       control_lower=torch.full((2,), -7.0), control_upper=torch.full((2,), 7.0),
+                       **mpc_domain_constraint(dynamics, 'defender', 'none'))
+    path = torch.zeros(1, 1, 3, 8)
+    path[..., 0] = 1.5                                 # attacker far away
+    path[0, 0, :, 4] = torch.tensor([0.5, 0.3, 0.1])   # defender dives into the 0.15 m zone (game ends there)
+    assert torch.allclose(domain_violation(dynamics, config, path), torch.tensor([[0.05]]))
+    path[0, 0, :, 4] = torch.tensor([0.5, 0.4, 0.3])   # stays outside
+    assert domain_violation(dynamics, config, path)[0, 0] == 0
+    assert mpc_domain_constraint(dynamics, 'attacker', 'none') == {}

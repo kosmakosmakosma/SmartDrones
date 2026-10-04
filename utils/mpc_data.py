@@ -143,14 +143,18 @@ def sample_mpc_initial_times(dataset, num_samples, distribution='uniform'):
     raise ValueError("distribution must be 'uniform' or 'tmax'")
 
 
-def mpc_domain_constraint(dynamics, player, mode='position'):
+def mpc_domain_constraint(dynamics, player, mode='position', defender_keep_out=True):
     """MPCConfig kwargs restricting `player`'s own drone to the training domain (state_mean +- state_var).
 
     mode: 'none', 'position' (own x/y positions) or 'state' (own positions and velocities).
+    defender_keep_out additionally rejects defender plans entering the defender exclusion zone.
     Only defined for the 8D interception state [px_a, vx_a, py_a, vy_a, px_d, vx_d, py_d, vy_d].
     """
+    keep_out = {}
+    if defender_keep_out and player == 'defender' and hasattr(dynamics, 'defender_exclusion_R'):
+        keep_out = dict(keep_out_dims=(4, 6), keep_out_radius=float(dynamics.defender_exclusion_R))
     if mode == 'none':
-        return {}
+        return keep_out
     if mode not in ('position', 'state'):
         raise ValueError("mode must be 'none', 'position' or 'state'")
     if dynamics.state_dim != 8:
@@ -159,4 +163,5 @@ def mpc_domain_constraint(dynamics, player, mode='position'):
     dims = tuple(offset + i for i in ((0, 2) if mode == 'position' else (0, 1, 2, 3)))
     mean = dynamics.state_mean.to(dtype=torch.float32)
     var = dynamics.state_var.to(dtype=torch.float32)
-    return dict(domain_dims=dims, domain_lower=(mean - var)[list(dims)], domain_upper=(mean + var)[list(dims)])
+    return dict(domain_dims=dims, domain_lower=(mean - var)[list(dims)], domain_upper=(mean + var)[list(dims)],
+                **keep_out)

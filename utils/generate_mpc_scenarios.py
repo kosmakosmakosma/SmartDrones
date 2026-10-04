@@ -71,6 +71,8 @@ def main():
     parser.add_argument('--optimized_player', default='joint', choices=['attacker', 'defender', 'joint'])
     parser.add_argument('--rollout', default='closed_loop', choices=['closed_loop', 'open_loop'])
     parser.add_argument('--replan_every', type=int, default=1)
+    parser.add_argument('--defender_keep_out', action=argparse.BooleanOptionalAction, default=True,
+                        help='Reject defender MPC plans that enter the defender exclusion zone')
     parser.add_argument('--domain_constraint', default='state', choices=['none', 'position', 'state'],
                         help='Reject MPC candidates whose own drone leaves the training domain before the game ends')
     parser.add_argument('--end_on_event', action=argparse.BooleanOptionalAction, default=True,
@@ -125,7 +127,7 @@ def main():
             num_iterations=args.iterations, noise_std=args.noise_fraction * bound,
             control_lower=torch.full((dim,), -bound), control_upper=torch.full((dim,), bound),
             integration_method=args.integrator, control_hold_steps=args.control_hold_steps,
-            **mpc_domain_constraint(dynamics, player, args.domain_constraint))
+            **mpc_domain_constraint(dynamics, player, args.domain_constraint, args.defender_keep_out))
     attacker_config = config(dynamics.accel_max_a, dynamics.control_dim, 'attacker')
     defender_config = config(dynamics.accel_max_d, dynamics.disturbance_dim, 'defender')
 

@@ -23,6 +23,10 @@ class MPCConfig:
     domain_dims: Optional[tuple] = None
     domain_lower: Optional[torch.Tensor] = None
     domain_upper: Optional[torch.Tensor] = None
+    # optional keep-out disc for this player's own position dims (e.g. the defender exclusion zone):
+    # candidates entering it are rejected just like candidates leaving the domain
+    keep_out_dims: Optional[tuple] = None
+    keep_out_radius: Optional[float] = None
 
     def __post_init__(self):
         if self.dt <= 0:
@@ -428,18 +432,24 @@ DOMAIN_PENALTY = 1e3
 
 
 def domain_violation(dynamics, config: MPCConfig, states):
-    """[...] largest distance by which config.domain_dims leave [domain_lower, domain_upper] before the game ends.
+    """[...] largest distance by which this player's own states leave the domain box or enter the keep-out disc.
 
     states: [...,H+1,S]. Steps after the first state inside the reach or avoid set are ignored, since
-    the game is over there. Returns None when the config has no domain constraint.
+    the game is over there; the terminal state itself counts, so ending the game by entering the
+    keep-out disc is a violation too. Returns None when the config has neither constraint.
     """
-    if config.domain_dims is None:
+    if config.domain_dims is None and config.keep_out_dims is None:
         return None
-    dims = list(config.domain_dims)
-    lower = torch.as_tensor(config.domain_lower, dtype=states.dtype, device=states.device)
-    upper = torch.as_tensor(config.domain_upper, dtype=states.dtype, device=states.device)
-    own = states[..., dims]
-    excess = (torch.clamp(own - upper, min=0) + torch.clamp(lower - own, min=0)).amax(dim=-1)
+    excess = torch.zeros(states.shape[:-1], dtype=states.dtype, device=states.device)
+    if config.domain_dims is not None:
+        dims = list(config.domain_dims)
+        lower = torch.as_tensor(config.domain_lower, dtype=states.dtype, device=states.device)
+        upper = torch.as_tensor(config.domain_upper, dtype=states.dtype, device=states.device)
+        own = states[..., dims]
+        excess = (torch.clamp(own - upper, min=0) + torch.clamp(lower - own, min=0)).amax(dim=-1)
+    if config.keep_out_dims is not None:
+        distance = torch.linalg.vector_norm(states[..., list(config.keep_out_dims)], dim=-1)
+        excess = torch.maximum(excess, torch.clamp(config.keep_out_radius - distance, min=0))
     ended = ((dynamics.reach_fn(states) <= 0) | (dynamics.avoid_fn(states) <= 0)).int()
     after_end = (torch.cumsum(ended, dim=-1) - ended) > 0
     return excess.masked_fill(after_end, 0.0).amax(dim=-1)

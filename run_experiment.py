@@ -116,6 +116,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_rollout', type=str, default='closed_loop', choices=['open_loop', 'closed_loop'], help="'closed_loop' re-plans from the reached state every --mpc_replan_every steps and labels the executed trajectory; 'open_loop' labels the single optimised plan")
     p.add_argument('--mpc_end_on_event', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Closed-loop rollouts stop at capture, target hit or exclusion breach; only states up to that point are labelled')
     p.add_argument('--mpc_domain_constraint', type=str, default='state', choices=['none', 'position', 'state'], help="Reject MPC candidates whose own drone leaves the training domain before the game ends: 'position' (x/y), 'state' (also velocities) or 'none'")
+    p.add_argument('--mpc_defender_keep_out', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Reject defender MPC plans that enter the defender exclusion zone (the breach still counts as an attacker win in labels)')
     p.add_argument('--mpc_game_solver', type=str, default='maxmin', choices=['alternating', 'maxmin'], help="Joint MPC planner: 'maxmin' scores every attacker x defender plan pair and each player keeps its best worst-case plan; 'alternating' best-responds to the opponent's current plan")
     p.add_argument('--mpc_use_network', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='false: joint MPC uses no network at all (zero initial plans, terminal-set margin as terminal value)')
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
@@ -271,6 +272,7 @@ if (mode == 'all') or (mode == 'train'):
         from utils.mpc_data import MPCReplayBuffer
         from utils.mpc_data import mpc_domain_constraint
         domain_mode = getattr(mpc_options, 'mpc_domain_constraint', 'none')
+        defender_keep_out = getattr(mpc_options, 'mpc_defender_keep_out', False)
 
         def make_mpc_config(control_bound, action_dim, player):
             absolute_noise = getattr(mpc_options, 'mpc_noise_std', None)
@@ -288,7 +290,7 @@ if (mode == 'all') or (mode == 'train'):
                 integration_method=mpc_options.mpc_integrator,
                 candidate_chunk_size=mpc_options.mpc_candidate_chunk_size,
                 control_hold_steps=getattr(mpc_options, 'mpc_control_hold_steps', 10),
-                **mpc_domain_constraint(dynamics, player, domain_mode),
+                **mpc_domain_constraint(dynamics, player, domain_mode, defender_keep_out),
             )
 
         mpc_config = {

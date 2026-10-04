@@ -114,6 +114,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_attacker_velocity_spread_deg', type=float, default=60.0, help='Max angle in degrees between the inward attacker velocity and the direction to the target')
     p.add_argument('--mpc_attacker_speed_max', type=float, default=None, help='Max inward attacker speed in m/s (defaults to the velocity domain bound)')
     p.add_argument('--mpc_rollout', type=str, default='closed_loop', choices=['open_loop', 'closed_loop'], help="'closed_loop' re-plans from the reached state every --mpc_replan_every steps and labels the executed trajectory; 'open_loop' labels the single optimised plan")
+    p.add_argument('--mpc_end_on_event', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Closed-loop rollouts stop at capture, target hit or exclusion breach; only states up to that point are labelled')
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
     p.add_argument('--mpc_time_distribution', type=str, default='tmax', choices=['uniform', 'tmax'], help="Time-to-go of MPC initial states: 'tmax' starts every rollout at tMax, 'uniform' follows the training curriculum")
     p.add_argument('--mpc_start_epoch', type=int, default=0, help='First global training epoch at which MPC replay generation is enabled')
@@ -311,6 +312,7 @@ if (mode == 'all') or (mode == 'train'):
         mpc_time_distribution=getattr(mpc_options, 'mpc_time_distribution', 'uniform'),
         mpc_rollout=getattr(mpc_options, 'mpc_rollout', 'open_loop'),
         mpc_replan_every=getattr(mpc_options, 'mpc_replan_every', 1),
+        mpc_end_on_event=getattr(mpc_options, 'mpc_end_on_event', False),
         mpc_batch_size=getattr(mpc_options, 'mpc_batch_size', 1000), mpc_loss_weight=getattr(mpc_options, 'mpc_loss_weight', 1.0),
         mpc_seed=getattr(mpc_options, 'mpc_seed', None),
         mpc_initial_guess=getattr(mpc_options, 'mpc_initial_guess', 'network'),

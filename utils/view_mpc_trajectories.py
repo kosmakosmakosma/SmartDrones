@@ -6,6 +6,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.patches import Circle
 from matplotlib.widgets import Button
 
 
@@ -42,6 +43,23 @@ def load_trajectories(checkpoint_path, num_initial_states, horizon_steps):
     return checkpoint, states, times, values, discarded
 
 
+def first_event(trajectory, geometry):
+    """(step, outcome) of the first terminal event, or (last step, 'timeout')."""
+    attacker = trajectory[:, [0, 2]]
+    defender = trajectory[:, [4, 6]]
+    attacker_target = np.linalg.norm(attacker, axis=-1) <= geometry["target_R"]
+    defender_breach = np.linalg.norm(defender, axis=-1) <= geometry["defender_exclusion_R"]
+    captured = (np.linalg.norm(attacker - defender, axis=-1) <= geometry["capture_R"]) & ~defender_breach
+    for step in range(trajectory.shape[0]):   # same precedence as the reach-avoid score: capture wins ties
+        if captured[step]:
+            return step, "attacker captured"
+        if attacker_target[step]:
+            return step, "attacker reached target"
+        if defender_breach[step]:
+            return step, "defender entered exclusion zone"
+    return trajectory.shape[0] - 1, "timeout"
+
+
 def save_export(output_path, checkpoint, states, times, values, discarded):
     np.savez_compressed(
         output_path,
@@ -53,7 +71,7 @@ def save_export(output_path, checkpoint, states, times, values, discarded):
     )
 
 
-def show_trajectory_browser(states, times, values, output_path, discarded):
+def show_trajectory_browser(states, times, values, output_path, discarded, geometry):
     run_count, trajectory_count, step_count, _ = states.shape
     current_run = 0
     current_trajectory = 0
@@ -65,9 +83,19 @@ def show_trajectory_browser(states, times, values, output_path, discarded):
         path_axis.clear()
         state_axis.clear()
 
-        trajectory = states[current_run, current_trajectory]
-        trajectory_times = times[current_run, current_trajectory]
-        trajectory_values = values[current_run, current_trajectory]
+        event_step, outcome = first_event(states[current_run, current_trajectory], geometry)
+        trajectory = states[current_run, current_trajectory, :event_step + 1]
+        trajectory_times = times[current_run, current_trajectory, :event_step + 1]
+        trajectory_values = values[current_run, current_trajectory, :event_step + 1]
+
+        path_axis.add_patch(Circle((0, 0), geometry["target_R"], fill=True, alpha=0.15, color="green",
+                                   label="target (r=%.2f)" % geometry["target_R"]))
+        path_axis.add_patch(Circle((0, 0), geometry["defender_exclusion_R"], fill=False, color="purple",
+                                   linestyle="-.", linewidth=1.5,
+                                   label="defender exclusion (r=%.2f)" % geometry["defender_exclusion_R"]))
+        path_axis.add_patch(Circle((trajectory[-1, 4], trajectory[-1, 6]), geometry["capture_R"], fill=False,
+                                   color="tab:orange", linestyle=":", linewidth=1.2,
+                                   label="capture radius (r=%.2f)" % geometry["capture_R"]))
 
         path_axis.plot(
             trajectory[:, 0], trajectory[:, 2], "o-", markersize=3,
@@ -84,7 +112,7 @@ def show_trajectory_browser(states, times, values, output_path, discarded):
         path_axis.set_ylabel("y position")
         path_axis.axis("equal")
         path_axis.grid(alpha=0.3)
-        path_axis.legend(loc="best")
+        path_axis.legend(loc="best", fontsize="small")
 
         elapsed = trajectory_times[0] - trajectory_times
         state_axis.plot(elapsed, trajectory[:, 0], label="attacker x")
@@ -99,11 +127,11 @@ def show_trajectory_browser(states, times, values, output_path, discarded):
 
         score_start = trajectory_values[0]
         figure.suptitle(
-            "MPC run %d/%d | trajectory %d/%d | initial suffix value %.5g"
+            "MPC run %d/%d | trajectory %d/%d | initial suffix value %.5g\n%s after %.2fs"
             % (
                 current_run + 1, run_count,
                 current_trajectory + 1, trajectory_count,
-                score_start,
+                score_start, outcome, trajectory_times[0] - trajectory_times[-1],
             )
         )
         figure.canvas.draw_idle()
@@ -143,13 +171,23 @@ def main():
     parser.add_argument("--output", default="mpc_trajectories.npz")
     parser.add_argument("--num-initial-states", type=int, default=300)
     parser.add_argument("--horizon-steps", type=int, default=50)
+    parser.add_argument("--target-R", type=float, default=0.25)
+    parser.add_argument("--capture-R", type=float, default=0.2)
+    parser.add_argument("--exclusion-R", type=float, default=None,
+                        help="Defender exclusion radius (default: stored in the file, else target-R + capture-R)")
     args = parser.parse_args()
 
     checkpoint, states, times, values, discarded = load_trajectories(
         args.checkpoint, args.num_initial_states, args.horizon_steps
     )
+    geometry = dict(checkpoint.get("scenario_geometry") or {})
+    geometry.setdefault("target_R", args.target_R)
+    geometry.setdefault("capture_R", args.capture_R)
+    geometry.setdefault("defender_exclusion_R", geometry["target_R"] + geometry["capture_R"])
+    if args.exclusion_R is not None:
+        geometry["defender_exclusion_R"] = args.exclusion_R
     save_export(args.output, checkpoint, states, times, values, discarded)
-    show_trajectory_browser(states, times, values, args.output, discarded)
+    show_trajectory_browser(states, times, values, args.output, discarded, geometry)
 
 
 if __name__ == "__main__":

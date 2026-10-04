@@ -65,6 +65,8 @@ def main():
     parser.add_argument('--optimized_player', default='joint', choices=['attacker', 'defender', 'joint'])
     parser.add_argument('--rollout', default='closed_loop', choices=['closed_loop', 'open_loop'])
     parser.add_argument('--replan_every', type=int, default=1)
+    parser.add_argument('--end_on_event', action=argparse.BooleanOptionalAction, default=True,
+                        help='Stop each scenario at capture, target hit or exclusion breach (closed loop only)')
     parser.add_argument('--initial_guess', default='network', choices=['network', 'zero'])
     parser.add_argument('--dt', type=float, default=0.02)
     parser.add_argument('--horizon_steps', type=int, default=50)
@@ -123,7 +125,7 @@ def main():
         result = closed_loop_rollout(
             states, times, nominal_u, nominal_d, responder, dynamics, attacker_config, defender_config,
             args.optimized_player, replan_every=args.replan_every, generator=generator,
-            use_network_terminal_value=True)
+            use_network_terminal_value=True, end_on_event=args.end_on_event)
     elif args.optimized_player == 'joint':
         result = optimize_joint_sequences(
             states, times, nominal_u, nominal_d, responder, dynamics, attacker_config, defender_config,
@@ -141,6 +143,10 @@ def main():
             'values': result.suffix_values.reshape(-1).cpu(),
         },
         'generation_args': vars(args),
+        'scenario_geometry': {
+            'target_R': dynamics.target_R, 'capture_R': dynamics.capture_R,
+            'defender_exclusion_R': dynamics.defender_exclusion_R,
+        },
     }, args.output)
     attacker_wins = (result.score <= 0).float().mean().item()
     print('Saved %d scenarios x %d states to %s (attacker succeeds in %.0f%%, mean score %.3f)' % (

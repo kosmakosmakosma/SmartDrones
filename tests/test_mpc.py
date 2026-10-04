@@ -439,3 +439,25 @@ def test_closed_loop_replanning_follows_dynamics_and_labels_executed_path():
                               reach_avoid_suffix_values(dynamics, result.states, terminal), atol=1e-6)
         assert torch.all(result.controls.abs() <= 5.0 + 1e-6)
         assert torch.all(result.defender_controls.abs() <= 7.0 + 1e-6)
+
+
+def test_closed_loop_ends_at_first_terminal_event():
+    from controllers.mpc import closed_loop_rollout
+    dynamics, responder, states, times, (att, dfn), nominal_u, nominal_d = _closed_loop_setup(horizon_steps=40)
+    states = states.clone()
+    states[0, [0, 2]] = torch.tensor([0.3, 0.0])     # attacker just outside the target, flying in
+    states[0, [1, 3]] = torch.tensor([-2.0, 0.0])
+    states[0, [4, 6]] = torch.tensor([0.0, 1.5])     # defender far away
+    times = torch.full_like(times, 40 * 0.02)
+    result = closed_loop_rollout(
+        states, times, nominal_u[:, :40], nominal_d[:, :40], responder, dynamics, att, dfn, 'joint',
+        replan_every=1, generator=torch.Generator().manual_seed(0), use_network_terminal_value=True,
+        end_on_event=True)
+    event = result.event_steps[0].item()
+    assert event < 40
+    final = result.states[0, event]
+    assert (dynamics.reach_fn(final) <= 0) or (dynamics.avoid_fn(final) <= 0)
+    assert torch.allclose(result.states[0, event:], final.expand(41 - event, -1))   # frozen after the event
+    boundary = torch.maximum(dynamics.reach_fn(final), -dynamics.avoid_fn(final))
+    assert torch.allclose(result.suffix_values[0, event:], boundary.expand(41 - event))
+    assert result.score[0] <= 0                       # attacker reached the target

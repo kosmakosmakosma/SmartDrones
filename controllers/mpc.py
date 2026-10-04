@@ -62,6 +62,7 @@ class MPCResult:
     suffix_values: torch.Tensor     # [B,H+1]
     score: torch.Tensor             # [B]
     all_scores: torch.Tensor        # [B,N] (final iteration, all candidates)
+    event_steps: Optional[torch.Tensor] = None  # [B] first step at which the game ended (H if it never did)
 
 
 def sample_control_sequences(
@@ -701,6 +702,7 @@ def closed_loop_rollout(
     generator: Optional[torch.Generator] = None,
     terminal_value_fn: Optional[Callable] = None,
     use_network_terminal_value: bool = False,
+    end_on_event: bool = False,
 ) -> MPCResult:
     """Receding-horizon rollout: re-optimise every `replan_every` steps from the state actually reached.
 
@@ -708,6 +710,9 @@ def closed_loop_rollout(
     not optimised reacts to the current state with the responder's bang-bang policy at every step.
     The planning horizon shrinks so every plan ends at the same final step, hence replan_every equal
     to the horizon reproduces the corresponding open-loop optimisation exactly.
+    With end_on_event, a trajectory stops (its state is frozen) at the first state inside the reach set
+    (reach_fn <= 0, e.g. target hit) or the avoid set (avoid_fn <= 0, e.g. capture); its label at that
+    state is then max(reach, -avoid) of that state, as if the game ended there.
     Returns the executed trajectory, labelled with the reach-avoid recursion over it.
     """
     if optimized_player not in ("attacker", "defender", "joint"):
@@ -731,6 +736,8 @@ def closed_loop_rollout(
 
     plan_u, plan_d = nominal_controls, nominal_disturbances
     plan_start = 0
+    event_steps = torch.full((batch_size,), horizon_steps, dtype=torch.long, device=device)
+    ended = torch.zeros(batch_size, dtype=torch.bool, device=device)
     for step in range(horizon_steps):
         offset = step - plan_start
         if step % replan_every == 0:
@@ -764,12 +771,22 @@ def closed_loop_rollout(
             u = plan_u[:, offset] if optimized_player == "attacker" else query.controls
             d = plan_d[:, offset] if optimized_player == "defender" else query.disturbances
 
+        if end_on_event:
+            newly_ended = ~ended & ((dynamics.reach_fn(current_states) <= 0) | (dynamics.avoid_fn(current_states) <= 0))
+            event_steps = torch.where(newly_ended, torch.full_like(event_steps, step), event_steps)
+            ended = ended | newly_ended
+            u = torch.where(ended.unsqueeze(-1), torch.zeros_like(u), u)
+            d = torch.where(ended.unsqueeze(-1), torch.zeros_like(d), d)
         next_states = integrate_step(dynamics, current_states, u, d, dt, config.integration_method).detach()
-        active = current_times > 0
+        active = (current_times > 0) & ~ended
         current_states = torch.where(active.unsqueeze(-1), next_states, current_states)
         current_times = torch.clamp(current_times - dt, min=0.0)
         states[:, step + 1], times[:, step + 1] = current_states, current_times
         controls[:, step], disturbances[:, step] = u, d
+
+    if end_on_event:   # the final state itself may be the first one inside a terminal set
+        newly_ended = ~ended & ((dynamics.reach_fn(current_states) <= 0) | (dynamics.avoid_fn(current_states) <= 0))
+        ended = ended | newly_ended
 
     final_values = responder.query(current_states, current_times).values
     terminal_values = None
@@ -777,6 +794,9 @@ def closed_loop_rollout(
         terminal_values = terminal_value_fn(current_states, current_times)
     elif use_network_terminal_value:
         terminal_values = final_values
+    if end_on_event:   # a finished game has no future: its value is its terminal-set margin
+        boundary = torch.maximum(dynamics.reach_fn(current_states), -dynamics.avoid_fn(current_states))
+        terminal_values = boundary if terminal_values is None else torch.where(ended, boundary, terminal_values)
     suffix_values = reach_avoid_suffix_values(dynamics, states, terminal_values)
     network_values = torch.zeros(batch_size, horizon_steps + 1, device=device, dtype=dtype)
     network_values[:, -1] = final_values
@@ -784,4 +804,5 @@ def closed_loop_rollout(
         controls=controls, states=states, defender_controls=disturbances,
         network_values=network_values, suffix_values=suffix_values,
         score=suffix_values[:, 0], all_scores=suffix_values[:, :1],
+        event_steps=event_steps if end_on_event else None,
     )

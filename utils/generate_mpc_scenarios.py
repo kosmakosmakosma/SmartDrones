@@ -17,7 +17,7 @@ import pickle
 import torch
 
 from controllers.bang_bang import NeuralBangBangController
-from controllers.mpc import MPCConfig, closed_loop_rollout, optimize_joint_sequences, optimize_maxmin_sequences
+from controllers.mpc import MPCConfig, closed_loop_rollout, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
 from dynamics import dynamics as dynamics_module
 from utils.mpc_data import mpc_domain_constraint, sample_mpc_initial_states
 
@@ -58,8 +58,9 @@ def main():
     parser.add_argument('--no_network', action='store_true',
                         help='Joint MPC without any network: zero initial plans, terminal-set margin as terminal value '
                              '(an experiment is still used for its dynamics parameters and tMax if given)')
-    parser.add_argument('--game_solver', default='maxmin', choices=['maxmin', 'alternating'],
+    parser.add_argument('--game_solver', default='maxmin', choices=['maxmin', 'mixed', 'alternating'],
                         help="'maxmin': each player keeps its best worst-case plan over all plan pairs; "
+                             "'mixed': samples each player's plan from the matrix-game equilibrium mixture; "
                              "'alternating': best response to the opponent's current plan")
     parser.add_argument('--stand_in', action='store_true',
                         help='Use boundary_fn instead of a trained network (no experiment needed)')
@@ -147,7 +148,8 @@ def main():
             use_network_terminal_value=responder is not None, end_on_event=args.end_on_event,
             game_solver=args.game_solver)
     elif args.optimized_player == 'joint':
-        solver = optimize_maxmin_sequences if args.game_solver == 'maxmin' else optimize_joint_sequences
+        solver = {'maxmin': optimize_maxmin_sequences, 'mixed': optimize_mixed_sequences,
+                  'alternating': optimize_joint_sequences}[args.game_solver]
         result = solver(
             states, times, nominal_u, nominal_d, responder, dynamics, attacker_config, defender_config,
             generator=generator, use_network_terminal_value=responder is not None)

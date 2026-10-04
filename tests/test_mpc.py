@@ -552,3 +552,32 @@ def test_defender_keep_out_rejects_plans_entering_exclusion_zone():
     path[0, 0, :, 4] = torch.tensor([0.5, 0.4, 0.3])   # stays outside
     assert domain_violation(dynamics, config, path)[0, 0] == 0
     assert mpc_domain_constraint(dynamics, 'attacker', 'none') == {}
+
+
+def test_matrix_game_solver_known_equilibria():
+    from controllers.mpc import solve_matrix_game
+    tables = torch.tensor([
+        [[0.3, -0.1, 0.0], [-0.1, 0.3, 0.0], [9.0, 9.0, 9.0]],   # flank left/right (+ a dominated row): 50/50, value 0.1
+        [[0.0, 1.0, -1.0], [-1.0, 0.0, 1.0], [1.0, -1.0, 0.0]],  # rock-paper-scissors: uniform, value 0
+        [[0.2, 0.5, 0.4], [0.1, 0.3, 0.6], [0.4, 0.8, 0.9]],     # pure saddle point at (row 0, col 0)? check value
+    ])
+    p, q, value, gap = solve_matrix_game(tables, iterations=2000)
+    assert torch.allclose(p[0, :2], torch.tensor([0.5, 0.5]), atol=0.02) and p[0, 2] < 0.01
+    assert abs(value[0] - 0.1) < 0.01
+    assert torch.allclose(p[1], torch.full((3,), 1 / 3), atol=0.02) and abs(value[1]) < 0.01
+    pure_value = tables[2].amax(1).amin()   # min-max; the solver's value must lie in [max-min, min-max]
+    assert tables[2].amin(0).amax() - 0.01 <= value[2] <= pure_value + 0.01
+    assert torch.all(gap < 0.02)
+
+
+def test_mixed_solver_samples_from_equilibrium_and_brackets_value():
+    from controllers.mpc import closed_loop_rollout, optimize_mixed_sequences
+    dynamics, responder, states, times, (att, dfn), nominal_u, nominal_d = _closed_loop_setup()
+    result = optimize_mixed_sequences(states, times, nominal_u, nominal_d, None, dynamics, att, dfn,
+                                      generator=torch.Generator().manual_seed(1))
+    assert torch.all(result.lower_value <= result.game_value + 1e-4)
+    assert torch.all(result.game_value <= result.upper_value + 1e-4)
+    closed = closed_loop_rollout(states, times, nominal_u, nominal_d, None, dynamics, att, dfn, 'joint',
+                                 replan_every=4, generator=torch.Generator().manual_seed(1),
+                                 end_on_event=True, game_solver='mixed')
+    assert torch.isfinite(closed.suffix_values).all()

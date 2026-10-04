@@ -23,7 +23,7 @@ from sklearn import svm
 from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
-from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences, optimize_maxmin_sequences
+from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
 from utils.mpc_data import sample_mpc_initial_states, sample_mpc_initial_times
 
 
@@ -136,8 +136,8 @@ class Experiment(ABC):
 
         if initial_guess not in ('network', 'zero'):
             raise ValueError("initial_guess must be 'network' or 'zero'")
-        if game_solver not in ('alternating', 'maxmin'):
-            raise ValueError("game_solver must be 'alternating' or 'maxmin'")
+        if game_solver not in ('alternating', 'maxmin', 'mixed'):
+            raise ValueError("game_solver must be 'alternating', 'maxmin' or 'mixed'")
         if not use_network and optimized_player != 'joint':
             raise ValueError('MPC without the network requires optimized_player=joint')
         responder = (NeuralBangBangController(model=self.model, dynamics=dynamics, device=device)
@@ -196,7 +196,8 @@ class Experiment(ABC):
             nominal_disturbances = initial_sequence(
                 initial_query.disturbances if initial_query is not None else None,
                 defender_config.horizon_steps, dynamics.disturbance_dim)
-            solver = optimize_maxmin_sequences if game_solver == 'maxmin' else optimize_joint_sequences
+            solver = {'maxmin': optimize_maxmin_sequences, 'mixed': optimize_mixed_sequences,
+                      'alternating': optimize_joint_sequences}[game_solver]
             result = solver(
                 real_states, times, nominal_controls, nominal_disturbances,
                 responder, dynamics, attacker_config, defender_config,

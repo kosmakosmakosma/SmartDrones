@@ -73,6 +73,7 @@ class MPCResult:
     event_steps: Optional[torch.Tensor] = None  # [B] first step at which the game ended (H if it never did)
     upper_value: Optional[torch.Tensor] = None  # [B] max-min solver: attacker's guaranteed score min_i max_j
     lower_value: Optional[torch.Tensor] = None  # [B] max-min solver: defender's guaranteed score max_j min_i
+    game_value: Optional[torch.Tensor] = None   # [B] mixed solver: equilibrium value p^T M q
 
 
 def sample_control_sequences(
@@ -865,6 +866,149 @@ def optimize_maxmin_sequences(
     )
 
 
+def solve_matrix_game(table, iterations=300):
+    """Approximate mixed equilibrium of zero-sum matrix games, batched: table [B, Na, Nd], rows minimise.
+
+    Regret matching+ with alternating updates and linearly weighted averaging. Returns (p [B, Na],
+    q [B, Nd], value [B], gap [B]): the average strategies, their value p^T M q and the gap
+    max_j (p^T M)_j - min_i (M q)_i, which bounds how much either player could gain by deviating
+    (0 at an exact equilibrium).
+    """
+    batch_size, num_rows, num_cols = table.shape
+    regret_rows = torch.zeros(batch_size, num_rows, dtype=table.dtype, device=table.device)
+    regret_cols = torch.zeros(batch_size, num_cols, dtype=table.dtype, device=table.device)
+    p = torch.full_like(regret_rows, 1.0 / num_rows)
+    q = torch.full_like(regret_cols, 1.0 / num_cols)
+    p_sum, q_sum = torch.zeros_like(p), torch.zeros_like(q)
+
+    def normalise(regret, uniform):
+        total = regret.sum(dim=-1, keepdim=True)
+        return torch.where(total > 0, regret / total.clamp_min(1e-12), uniform)
+
+    for step in range(1, iterations + 1):
+        row_loss = torch.einsum("bij,bj->bi", table, q)            # attacker minimises
+        regret_rows = torch.clamp(regret_rows + (p * row_loss).sum(-1, keepdim=True) - row_loss, min=0)
+        p = normalise(regret_rows, torch.full_like(p, 1.0 / num_rows))
+        col_gain = torch.einsum("bij,bi->bj", table, p)            # defender maximises
+        regret_cols = torch.clamp(regret_cols + col_gain - (q * col_gain).sum(-1, keepdim=True), min=0)
+        q = normalise(regret_cols, torch.full_like(q, 1.0 / num_cols))
+        p_sum += step * p
+        q_sum += step * q
+
+    p = p_sum / p_sum.sum(-1, keepdim=True)
+    q = q_sum / q_sum.sum(-1, keepdim=True)
+    value = torch.einsum("bi,bij,bj->b", p, table, q)
+    gap = torch.einsum("bi,bij->bj", p, table).amax(-1) - torch.einsum("bij,bj->bi", table, q).amin(-1)
+    return p, q, value, gap
+
+
+def optimize_mixed_sequences(
+    initial_states, initial_times, nominal_controls, nominal_disturbances,
+    responder: Optional[NeuralBangBangController], dynamics,
+    attacker_config: MPCConfig, defender_config: MPCConfig,
+    generator: Optional[torch.Generator] = None,
+    terminal_value_fn: Optional[Callable] = None,
+    use_network_terminal_value: bool = False,
+    matrix_game_iterations: int = 300,
+) -> MPCResult:
+    """Game MPC with mixed strategies over the full attacker x defender plan table.
+
+    Each iteration rolls out every candidate pair, solves the score table as a zero-sum matrix game
+    (solve_matrix_game) and keeps the quarter of each player's plans with the highest equilibrium
+    probability; new candidates are sampled around the most probable plan (double-oracle style pool
+    growth). Plans leaving their owner's domain are dominated by a large penalty. Finally each player
+    samples the plan it executes from its equilibrium mixture.
+    Returns the rollout of the sampled pair; game_value is the mixed value p^T M q, and
+    upper_value / lower_value bracket it (their difference is the equilibrium gap).
+    """
+    if initial_states.ndim != 2:
+        raise ValueError("initial_states must have shape [B,S]")
+    compatible_fields = ("dt", "horizon_steps", "num_iterations", "integration_method")
+    if any(getattr(attacker_config, field) != getattr(defender_config, field) for field in compatible_fields):
+        raise ValueError("attacker and defender configs must share dt, horizon, iterations, and integrator")
+
+    batch_size = initial_states.shape[0]
+    horizon_steps = attacker_config.horizon_steps
+    num_attacker, num_defender = attacker_config.num_samples, defender_config.num_samples
+    keep_attacker, keep_defender = max(1, num_attacker // 4), max(1, num_defender // 4)
+    rows_per_chunk = attacker_config.candidate_chunk_size or min(num_attacker, 8)
+    use_network = use_network_terminal_value and terminal_value_fn is None and responder is not None
+    query_mode = "final" if use_network else "none"
+    batch_index = torch.arange(batch_size, device=initial_states.device)
+
+    def terminal(rollout):
+        if terminal_value_fn is not None:
+            return terminal_value_fn(rollout.states[:, :, -1], rollout.times[:, :, -1])
+        return rollout.network_values[:, :, -1] if use_network else None
+
+    def gather_plans(plans, indices):
+        return plans[batch_index[:, None], indices]
+
+    def candidates(config, centre, kept, count):
+        fresh = sample_control_sequences(
+            centre, count, config.noise_std, config.control_lower, config.control_upper,
+            generator=generator, control_hold_steps=config.control_hold_steps,
+            include_axis_candidates=config.include_axis_candidates)
+        return fresh if kept is None else torch.cat((kept, fresh), dim=1)
+
+    kept_attacker = kept_defender = None
+    centre_attacker, centre_defender = nominal_controls, nominal_disturbances
+    for _ in range(attacker_config.num_iterations):
+        attacker_candidates = candidates(attacker_config, centre_attacker, kept_attacker,
+                                         num_attacker - (0 if kept_attacker is None else keep_attacker))
+        defender_candidates = candidates(defender_config, centre_defender, kept_defender,
+                                         num_defender - (0 if kept_defender is None else keep_defender))
+
+        table, attacker_violation, defender_violation = [], [], []
+        for start in range(0, num_attacker, rows_per_chunk):
+            end = min(start + rows_per_chunk, num_attacker)
+            rows = end - start
+            pair_controls = attacker_candidates[:, start:end, None].expand(
+                batch_size, rows, num_defender, horizon_steps, dynamics.control_dim
+            ).reshape(batch_size, rows * num_defender, horizon_steps, dynamics.control_dim)
+            pair_disturbances = defender_candidates[:, None].expand(
+                batch_size, rows, num_defender, horizon_steps, dynamics.disturbance_dim
+            ).reshape(batch_size, rows * num_defender, horizon_steps, dynamics.disturbance_dim)
+            rollout = rollout_joint_sequences(
+                initial_states, initial_times, pair_controls, pair_disturbances, responder, dynamics,
+                attacker_config.dt, attacker_config.integration_method, query_mode)
+            scores, _ = evaluate_rollouts(dynamics, rollout, terminal(rollout))
+            table.append(scores.view(batch_size, rows, num_defender))
+            for violations, config in ((attacker_violation, attacker_config), (defender_violation, defender_config)):
+                violation = domain_violation(dynamics, config, rollout.states)
+                violations.append((torch.zeros_like(scores) if violation is None else violation)
+                                  .view(batch_size, rows, num_defender))
+
+        table = torch.cat(table, dim=1)
+        attacker_penalty = _violation_penalty(torch.cat(attacker_violation, dim=1).amax(dim=2))
+        defender_penalty = _violation_penalty(torch.cat(defender_violation, dim=1).amax(dim=1))
+        game = table + attacker_penalty[:, :, None] - defender_penalty[:, None, :]
+        p, q, value, gap = solve_matrix_game(game, matrix_game_iterations)
+
+        kept_attacker = gather_plans(attacker_candidates, p.topk(keep_attacker, dim=1).indices)
+        kept_defender = gather_plans(defender_candidates, q.topk(keep_defender, dim=1).indices)
+        centre_attacker, centre_defender = kept_attacker[:, 0], kept_defender[:, 0]
+
+    chosen_attacker = torch.multinomial(p, 1, generator=generator).squeeze(1)
+    chosen_defender = torch.multinomial(q, 1, generator=generator).squeeze(1)
+    attacker_plan = attacker_candidates[batch_index, chosen_attacker]
+    defender_plan = defender_candidates[batch_index, chosen_defender]
+    rollout = rollout_joint_sequences(
+        initial_states, initial_times, attacker_plan[:, None], defender_plan[:, None], responder, dynamics,
+        attacker_config.dt, attacker_config.integration_method, query_mode)
+    if responder is not None:
+        rollout.network_values[:, :, 0] = responder.query(initial_states, initial_times).values[:, None]
+    scores, suffix_values = evaluate_rollouts(dynamics, rollout, terminal(rollout))
+    return MPCResult(
+        controls=attacker_plan, states=rollout.states[:, 0], defender_controls=defender_plan,
+        network_values=rollout.network_values[:, 0], suffix_values=suffix_values[:, 0],
+        score=scores[:, 0], all_scores=table.flatten(1),
+        upper_value=torch.einsum("bi,bij->bj", p, game).amax(-1),
+        lower_value=torch.einsum("bij,bj->bi", game, q).amin(-1),
+        game_value=value,
+    )
+
+
 def shift_control_sequence(sequence):
     """Receding-horizon warm start: drop the first action, repeat the final action."""
     return torch.cat((sequence[..., 1:, :], sequence[..., -1:, :]), dim=-2)
@@ -890,13 +1034,14 @@ def closed_loop_rollout(
     With end_on_event, a trajectory stops (its state is frozen) at the first state inside the reach set
     (reach_fn <= 0, e.g. target hit) or the avoid set (avoid_fn <= 0, e.g. capture); its label at that
     state is then max(reach, -avoid) of that state, as if the game ended there.
-    game_solver picks the joint planner: 'alternating' (optimize_joint_sequences) or 'maxmin'
-    (optimize_maxmin_sequences). With optimized_player='joint' the responder may be None: the
+    game_solver picks the joint planner: 'alternating' (optimize_joint_sequences), 'maxmin'
+    (optimize_maxmin_sequences) or 'mixed' (optimize_mixed_sequences: each re-plan samples the
+    executed plans from the equilibrium mixtures). With optimized_player='joint' the responder may be None: the
     network is then not used at all and the terminal value is the terminal-set margin.
     Returns the executed trajectory, labelled with the reach-avoid recursion over it.
     """
-    if game_solver not in ("alternating", "maxmin"):
-        raise ValueError("game_solver must be 'alternating' or 'maxmin'")
+    if game_solver not in ("alternating", "maxmin", "mixed"):
+        raise ValueError("game_solver must be 'alternating', 'maxmin' or 'mixed'")
     if responder is None and optimized_player != "joint":
         raise ValueError("a responder is required unless optimized_player is 'joint'")
     if optimized_player not in ("attacker", "defender", "joint"):
@@ -934,7 +1079,8 @@ def closed_loop_rollout(
             attacker_now = replace(attacker_config, horizon_steps=steps_left)
             defender_now = replace(defender_config, horizon_steps=steps_left)
             if optimized_player == "joint":
-                solver = optimize_maxmin_sequences if game_solver == "maxmin" else optimize_joint_sequences
+                solver = {"maxmin": optimize_maxmin_sequences, "mixed": optimize_mixed_sequences,
+                          "alternating": optimize_joint_sequences}[game_solver]
                 result = solver(
                     current_states, current_times, plan_u, plan_d, responder, dynamics,
                     attacker_now, defender_now, generator, terminal_value_fn, use_network_terminal_value)

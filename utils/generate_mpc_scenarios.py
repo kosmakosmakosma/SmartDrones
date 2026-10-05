@@ -23,7 +23,7 @@ from utils.mpc_data import in_domain_mask, mpc_domain_constraint, sample_mpc_ini
 
 
 def load_experiment(experiments_dir, experiment_name, checkpoint, device, defender_exclusion_R,
-                    vel_max_a=None, vel_max_d=None):
+                    vel_max_a=None, vel_max_d=None, accel_max=None):
     from utils import modules
     experiment_dir = os.path.join(experiments_dir, experiment_name)
     with open(os.path.join(experiment_dir, 'orig_opt.pickle'), 'rb') as file:
@@ -36,6 +36,8 @@ def load_experiment(experiments_dir, experiment_name, checkpoint, device, defend
         params['defender_exclusion_R'] = defender_exclusion_R
     if 'vel_max_a' in inspect.signature(dynamics_class).parameters:
         params.update(vel_max_a=vel_max_a, vel_max_d=vel_max_d)
+    if accel_max is not None:
+        params.update(accel_max_a=accel_max, accel_max_d=accel_max)
     dynamics = dynamics_class(**params)
     dynamics.deepreach_model = orig_opt.deepreach_model
 
@@ -70,6 +72,9 @@ def main():
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output', default='mpc_scenarios.pth')
     parser.add_argument('--defender_exclusion_R', type=float, default=0.15)
+    parser.add_argument('--accel_max', type=float, default=5.0,
+                        help='Acceleration limit per axis in m/s^2, the same for both players '
+                             '(<= 0: keep the experiment values, or 5 / 7 without an experiment)')
     parser.add_argument('--vel_max_d', type=float, default=3.0, help='Defender speed limit in m/s (<= 0: unlimited)')
     parser.add_argument('--vel_max_a_ratio', type=float, default=0.8,
                         help='Attacker speed limit as a fraction of the defender limit')
@@ -98,17 +103,19 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
+    accel_max = args.accel_max if args.accel_max > 0 else None
+    accel_a, accel_d = (accel_max, accel_max) if accel_max is not None else (5.0, 7.0)
     vel_max_d = args.vel_max_d if args.vel_max_d > 0 else None
     vel_max_a = None if vel_max_d is None else args.vel_max_a_ratio * vel_max_d
     if args.no_network and args.experiment_name is None:
         dynamics = dynamics_module.CrazyflieInterception(
-            0.25, 0.2, 5.0, 7.0, defender_exclusion_R=args.defender_exclusion_R,
+            0.25, 0.2, accel_a, accel_d, defender_exclusion_R=args.defender_exclusion_R,
             vel_max_a=vel_max_a, vel_max_d=vel_max_d)
         responder, t_max, device = None, 1.0, 'cpu'
     elif args.stand_in:
         from utils.benchmark_mpc import BoundaryResponder
         dynamics = dynamics_module.CrazyflieInterception(
-            0.25, 0.2, 5.0, 7.0, defender_exclusion_R=args.defender_exclusion_R,
+            0.25, 0.2, accel_a, accel_d, defender_exclusion_R=args.defender_exclusion_R,
             vel_max_a=vel_max_a, vel_max_d=vel_max_d)
         responder, t_max, device = BoundaryResponder(dynamics), 1.0, 'cpu'
     else:
@@ -117,7 +124,7 @@ def main():
         device = args.device
         dynamics, responder, t_max = load_experiment(
             args.experiments_dir, args.experiment_name, args.checkpoint, device, args.defender_exclusion_R,
-            vel_max_a, vel_max_d)
+            vel_max_a, vel_max_d, accel_max)
     if args.no_network:
         responder = None
         if args.optimized_player != 'joint':
@@ -189,6 +196,7 @@ def main():
             'defender_exclusion_R': dynamics.defender_exclusion_R,
             'position_bound': float(dynamics.state_var[0]), 'velocity_bound': float(dynamics.state_var[1]),
             'vel_max_a': dynamics.vel_max_a, 'vel_max_d': dynamics.vel_max_d,
+            'accel_max_a': dynamics.accel_max_a, 'accel_max_d': dynamics.accel_max_d,
         },
     }, args.output)
     attacker_wins = (result.score <= 0).float().mean().item()

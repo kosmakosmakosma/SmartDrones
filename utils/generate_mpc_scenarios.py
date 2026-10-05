@@ -19,7 +19,7 @@ import torch
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import MPCConfig, closed_loop_rollout, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
 from dynamics import dynamics as dynamics_module
-from utils.mpc_data import mpc_domain_constraint, sample_mpc_initial_states
+from utils.mpc_data import in_domain_mask, mpc_domain_constraint, sample_mpc_initial_states
 
 
 def load_experiment(experiments_dir, experiment_name, checkpoint, device, defender_exclusion_R):
@@ -158,6 +158,12 @@ def main():
 
     steps = result.states.shape[1]
     label_times = torch.stack([torch.clamp(times - k * args.dt, min=0.0) for k in range(steps)], dim=1)
+    # Labels cover the full game; training stores only in-domain states (--mpc_crop_to_domain).
+    # The file keeps whole trajectories for the viewer plus the mask of states training would keep.
+    in_domain = in_domain_mask(dynamics, result.states)
+    live = torch.ones_like(in_domain)
+    if result.event_steps is not None:
+        live = torch.arange(steps, device=in_domain.device)[None] <= result.event_steps[:, None]
     torch.save({
         'epoch': -1 if (args.stand_in or args.no_network) else args.checkpoint,
         'mpc_replay_buffer': {
@@ -165,16 +171,21 @@ def main():
             'states': result.states.reshape(-1, dynamics.state_dim).cpu(),
             'values': result.suffix_values.reshape(-1).cpu(),
         },
+        'in_domain': in_domain.reshape(-1).cpu(),
         'generation_args': vars(args),
         'scenario_geometry': {
             'target_R': dynamics.target_R, 'capture_R': dynamics.capture_R,
             'defender_exclusion_R': dynamics.defender_exclusion_R,
+            'position_bound': float(dynamics.state_var[0]), 'velocity_bound': float(dynamics.state_var[1]),
         },
     }, args.output)
     attacker_wins = (result.score <= 0).float().mean().item()
     print('Saved %d scenarios x %d states to %s (attacker succeeds in %.0f%%, mean score %.3f)' % (
         args.num_initial_states, steps, os.path.abspath(args.output), 100 * attacker_wins,
         result.score.mean().item()))
+    print('Scenarios leaving the domain: %.0f%%; game states inside the domain (kept for training): %.0f%%' % (
+        100 * ((~in_domain) & live).any(dim=1).float().mean().item(),
+        100 * (in_domain & live).sum().item() / max(live.sum().item(), 1)))
     print('View with: python -m utils.view_mpc_trajectories %s --num-initial-states %d --horizon-steps %d' % (
         args.output, args.num_initial_states, steps - 1))
 

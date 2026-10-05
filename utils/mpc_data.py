@@ -165,3 +165,10 @@ def mpc_domain_constraint(dynamics, player, mode='position', defender_keep_out=T
     var = dynamics.state_var.to(dtype=torch.float32)
     return dict(domain_dims=dims, domain_lower=(mean - var)[list(dims)], domain_upper=(mean + var)[list(dims)],
                 **keep_out)
+
+
+def in_domain_mask(dynamics, states):
+    """[...] True where the whole state lies inside the training domain state_mean +- state_var."""
+    mean = dynamics.state_mean.to(dtype=states.dtype, device=states.device)
+    var = dynamics.state_var.to(dtype=states.dtype, device=states.device)
+    return ((states - mean).abs() <= var + 1e-6).all(dim=-1)

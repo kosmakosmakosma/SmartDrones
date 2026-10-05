@@ -24,7 +24,7 @@ from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
-from utils.mpc_data import sample_mpc_initial_states, sample_mpc_initial_times
+from utils.mpc_data import in_domain_mask, sample_mpc_initial_states, sample_mpc_initial_times
 
 
 class Experiment(ABC):
@@ -114,7 +114,7 @@ class Experiment(ABC):
             attacker_boundary_std=0.2, attacker_velocity='uniform',
             attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
             time_distribution='uniform', rollout='open_loop', replan_every=1,
-            end_on_event=False, game_solver='alternating', use_network=True):
+            end_on_event=False, game_solver='alternating', use_network=True, crop_to_domain=False):
         """Generate BRAT MPC labels against the current policy and add bootstrapped trajectory suffixes to `replay_buffer`."""
         dynamics = self.dataset.dynamics
         required_methods = ('reach_fn', 'avoid_fn', 'optimal_control', 'optimal_disturbance')
@@ -215,6 +215,8 @@ class Experiment(ABC):
         event_steps = getattr(result, 'event_steps', None)
         if event_steps is not None:   # states after the game ended are frozen duplicates: drop them
             keep = torch.arange(horizon_plus_one, device=label_times.device)[None] <= event_steps[:, None]
+        if crop_to_domain:   # labels were computed over the full game; only in-domain states are stored
+            keep = keep & in_domain_mask(dynamics, result.states)
         replay_buffer.add(
             label_times[keep].detach().cpu(),
             result.states[keep].reshape(-1, dynamics.state_dim).detach().cpu(),
@@ -367,7 +369,7 @@ class Experiment(ABC):
             mpc_attacker_velocity='uniform', mpc_attacker_velocity_spread_deg=60.0,
             mpc_attacker_speed_max=None, mpc_time_distribution='uniform',
             mpc_rollout='open_loop', mpc_replan_every=1, mpc_end_on_event=False,
-            mpc_game_solver='alternating', mpc_use_network=True,
+            mpc_game_solver='alternating', mpc_use_network=True, mpc_crop_to_domain=False,
             mpc_loss_weight=1.0, mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
         ):
@@ -483,7 +485,7 @@ class Experiment(ABC):
                             mpc_attacker_velocity, mpc_attacker_velocity_spread_deg,
                             mpc_attacker_speed_max, mpc_time_distribution,
                             mpc_rollout, mpc_replan_every, mpc_end_on_event,
-                            mpc_game_solver, mpc_use_network)
+                            mpc_game_solver, mpc_use_network, mpc_crop_to_domain)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)

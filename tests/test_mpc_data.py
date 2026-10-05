@@ -213,3 +213,30 @@ def test_closed_loop_refresh_passes_options_and_labels_executed_trajectory(monke
     assert calls['player'] == 'defender' and calls['replan_every'] == 2
     assert torch.equal(replay.times, torch.tensor([1.0, 0.75, 0.5, 1.0, 0.75, 0.5]))
     assert torch.equal(replay.values, torch.tensor([0.3, 0.2, 0.1, 0.3, 0.2, 0.1]))
+
+
+def test_crop_to_domain_stores_only_in_domain_labels(monkeypatch, tmp_path):
+    dynamics = CrazyflieInterception(0.25, 0.2, 5.0, 7.0, defender_exclusion_R=0.15)
+
+    class DatasetStub:
+        def __init__(self):
+            self.dynamics = dynamics
+
+        def _sample_times(self, count):
+            return torch.ones(count, 1)
+
+    def fake_closed_loop(states, times, nominal_u, nominal_d, responder, dyn, *args, **kwargs):
+        path = states[:, None].expand(states.shape[0], 3, 8).clone()
+        path[:, 2, 0] = 2.5                                   # last state leaves the position domain
+        return SimpleNamespace(states=path, suffix_values=torch.tensor([[0.3, 0.2, 0.1]]).expand(states.shape[0], 3),
+                               score=torch.full((states.shape[0],), 0.3), event_steps=None)
+
+    monkeypatch.setattr(experiments, 'closed_loop_rollout', fake_closed_loop)
+    experiment = experiments.DeepReach(torch.nn.Linear(9, 1), DatasetStub(), str(tmp_path), use_wandb=False)
+    replay = MPCReplayBuffer(state_dim=8, capacity=100)
+    config = SimpleNamespace(horizon_steps=2, dt=0.25)
+    experiment._refresh_mpc_dataset('cpu', {'attacker': config, 'defender': config}, 2, replay, 'joint',
+                                    state_distribution='interception', rollout='closed_loop',
+                                    crop_to_domain=True, use_network=False, initial_guess='zero')
+    assert len(replay) == 4                                       # 2 scenarios x 2 in-domain states
+    assert torch.equal(replay.values, torch.tensor([0.3, 0.2, 0.3, 0.2]))   # labels from the full game

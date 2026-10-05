@@ -6,7 +6,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Rectangle
 from matplotlib.widgets import Button
 
 
@@ -96,6 +96,19 @@ def show_trajectory_browser(states, times, values, output_path, discarded, geome
         path_axis.add_patch(Circle((trajectory[-1, 4], trajectory[-1, 6]), geometry["capture_R"], fill=False,
                                    color="tab:orange", linestyle=":", linewidth=1.2,
                                    label="capture radius (r=%.2f)" % geometry["capture_R"]))
+
+        bound = geometry.get("position_bound")
+        if bound is not None:
+            path_axis.add_patch(Rectangle((-bound, -bound), 2 * bound, 2 * bound, fill=False, color="gray",
+                                          linestyle="--", linewidth=1.0, label="domain"))
+            velocity_bound = geometry.get("velocity_bound", float("inf"))
+            outside = ((np.abs(trajectory[:, [0, 2, 4, 6]]) > bound + 1e-6).any(axis=1)
+                       | (np.abs(trajectory[:, [1, 3, 5, 7]]) > velocity_bound + 1e-6).any(axis=1))
+            if outside.any():
+                path_axis.scatter(trajectory[outside, 0], trajectory[outside, 2], marker="x", color="red", s=25,
+                                  label="outside domain (not stored)", zorder=5)
+                path_axis.scatter(trajectory[outside, 4], trajectory[outside, 6], marker="x", color="red", s=25,
+                                  zorder=5)
 
         path_axis.plot(
             trajectory[:, 0], trajectory[:, 2], "o-", markersize=3,

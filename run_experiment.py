@@ -117,6 +117,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_end_on_event', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Closed-loop rollouts stop at capture, target hit or exclusion breach; only states up to that point are labelled')
     p.add_argument('--mpc_domain_constraint', type=str, default='state', choices=['none', 'position', 'state'], help="Reject MPC candidates whose own drone leaves the training domain before the game ends: 'position' (x/y), 'state' (also velocities) or 'none'")
     p.add_argument('--mpc_defender_keep_out', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Reject defender MPC plans that enter the defender exclusion zone (the breach still counts as an attacker win in labels)')
+    p.add_argument('--mpc_crop_to_domain', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Store only MPC labels whose state lies inside the training domain (labels are still computed over the full game)')
     p.add_argument('--mpc_game_solver', type=str, default='maxmin', choices=['alternating', 'maxmin', 'mixed'], help="Joint MPC planner: 'maxmin' scores every attacker x defender plan pair and each player keeps its best worst-case plan; 'mixed' solves that table as a matrix game and samples each player's plan from its equilibrium mixture; 'alternating' best-responds to the opponent's current plan")
     p.add_argument('--mpc_use_network', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='false: joint MPC uses no network at all (zero initial plans, terminal-set margin as terminal value)')
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
@@ -324,6 +325,7 @@ if (mode == 'all') or (mode == 'train'):
         mpc_end_on_event=getattr(mpc_options, 'mpc_end_on_event', False),
         mpc_game_solver=getattr(mpc_options, 'mpc_game_solver', 'alternating'),
         mpc_use_network=getattr(mpc_options, 'mpc_use_network', True),
+        mpc_crop_to_domain=getattr(mpc_options, 'mpc_crop_to_domain', False),
         mpc_batch_size=getattr(mpc_options, 'mpc_batch_size', 1000), mpc_loss_weight=getattr(mpc_options, 'mpc_loss_weight', 1.0),
         mpc_seed=getattr(mpc_options, 'mpc_seed', None),
         mpc_initial_guess=getattr(mpc_options, 'mpc_initial_guess', 'network'),

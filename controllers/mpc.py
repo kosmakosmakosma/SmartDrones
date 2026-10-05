@@ -128,7 +128,10 @@ def integrate_step(dynamics, states, controls, disturbances, dt, method):
         next_states = states + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
     else:
         raise ValueError(f"unknown integration method '{method}'")
-    return dynamics.equivalent_wrapped_state(next_states)
+    next_states = dynamics.equivalent_wrapped_state(next_states)
+    if hasattr(dynamics, "limit_state"):   # e.g. speed limits applied after each step
+        next_states = dynamics.limit_state(next_states)
+    return next_states
 
 
 def rollout_control_sequences(

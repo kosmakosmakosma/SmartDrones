@@ -133,8 +133,13 @@ class Dynamics(ABC):
 class CrazyflieInterception(Dynamics):
     def __init__(self, target_R:float, capture_R:float,       # <-- type annotations added
                  accel_max_a:float, accel_max_d:float,
-                 defender_exclusion_R:float=None):
+                 defender_exclusion_R:float=None,
+                 vel_max_a:float=None, vel_max_d:float=None):
         self.target_R = target_R
+        # optional speed limits (m/s): after every integration step a faster drone's velocity is scaled
+        # back to the limit along its current direction (see limit_state); None means unlimited
+        self.vel_max_a = vel_max_a
+        self.vel_max_d = vel_max_d
         self.capture_R = capture_R
         # radius around the target the defender may not enter; defaults to target_R + capture_R
         self.defender_exclusion_R = (target_R + capture_R if defender_exclusion_R is None
@@ -176,6 +181,20 @@ class CrazyflieInterception(Dynamics):
     def equivalent_wrapped_state(self, state):
         """No angular states to wrap in double integrator dynamics."""
         return torch.clone(state)
+
+    def limit_state(self, state):
+        """Scale each drone's velocity back to its speed limit, keeping its direction."""
+        if self.vel_max_a is None and self.vel_max_d is None:
+            return state
+        state = torch.clone(state)
+        for (vx, vy), vel_max in (((1, 3), self.vel_max_a), ((5, 7), self.vel_max_d)):
+            if vel_max is None:
+                continue
+            velocity = state[..., [vx, vy]]
+            speed = torch.linalg.vector_norm(velocity, dim=-1, keepdim=True)
+            velocity = velocity * torch.clamp(vel_max / speed.clamp_min(1e-12), max=1.0)
+            state[..., vx], state[..., vy] = velocity[..., 0], velocity[..., 1]
+        return state
 
     def sample_target_state(self, num_samples):
         raise NotImplementedError

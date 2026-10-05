@@ -581,3 +581,22 @@ def test_mixed_solver_samples_from_equilibrium_and_brackets_value():
                                  replan_every=4, generator=torch.Generator().manual_seed(1),
                                  end_on_event=True, game_solver='mixed')
     assert torch.isfinite(closed.suffix_values).all()
+
+
+def test_speed_limit_scales_velocity_back_along_its_direction():
+    from controllers.mpc import integrate_step
+    from dynamics.dynamics import CrazyflieInterception
+    dynamics = CrazyflieInterception(0.25, 0.2, 5.0, 7.0, defender_exclusion_R=0.15, vel_max_a=2.4, vel_max_d=3.0)
+    state = torch.tensor([[0.0, 2.0, 0.0, 1.5, 1.0, 2.9, 1.0, 0.0]])   # attacker 2.5 m/s, defender 2.9 m/s
+    nxt = integrate_step(dynamics, state, torch.tensor([[5.0, 5.0]]), torch.tensor([[7.0, 0.0]]), 0.02, 'euler')
+    attacker_v, defender_v = nxt[0, [1, 3]], nxt[0, [5, 7]]
+    assert torch.isclose(attacker_v.norm(), torch.tensor(2.4))
+    assert torch.isclose(defender_v.norm(), torch.tensor(3.0))
+    # direction is kept: the clipped velocity is parallel to the unclipped one
+    raw = state[0, [1, 3]] + 0.02 * torch.tensor([5.0, 5.0])
+    assert torch.allclose(attacker_v / attacker_v.norm(), raw / raw.norm(), atol=1e-6)
+    # positions integrate the pre-step velocity as before; slower drones are untouched
+    slow = torch.tensor([[0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]])
+    assert torch.allclose(integrate_step(dynamics, slow, torch.zeros(1, 2), torch.zeros(1, 2), 0.02, 'euler'), slow
+                          + 0.02 * dynamics.dsdt(slow, torch.zeros(1, 2), torch.zeros(1, 2)))
+    assert CrazyflieInterception(0.25, 0.2, 5.0, 7.0).limit_state(state) is state   # unlimited by default

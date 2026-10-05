@@ -119,6 +119,8 @@ def sample_mpc_initial_states(
     states[:, [5, 7]] = 0.0
     if attacker_velocity == 'inward':
         speed_limit = min(upper[1].item(), upper[3].item())
+        if getattr(dynamics, 'vel_max_a', None) is not None:
+            speed_limit = min(speed_limit, dynamics.vel_max_a)
         speed_max = speed_limit if attacker_speed_max is None else attacker_speed_max
         heading = torch.atan2(-states[:, 2], -states[:, 0]) + torch.empty(num_samples).uniform_(
             -math.radians(attacker_velocity_spread_deg), math.radians(attacker_velocity_spread_deg))
@@ -127,6 +129,8 @@ def sample_mpc_initial_states(
         states[:, 3] = (speed * torch.sin(heading)).clamp(lower[3], upper[3])
     elif attacker_velocity != 'uniform':
         raise ValueError("attacker_velocity must be 'uniform' or 'inward'")
+    if hasattr(dynamics, 'limit_state'):   # respect speed limits in the initial states too
+        states = dynamics.limit_state(states)
     return states
 
 

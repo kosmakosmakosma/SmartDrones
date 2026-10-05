@@ -74,7 +74,7 @@ def main():
     parser.add_argument('--replan_every', type=int, default=1)
     parser.add_argument('--defender_keep_out', action=argparse.BooleanOptionalAction, default=True,
                         help='Reject defender MPC plans that enter the defender exclusion zone')
-    parser.add_argument('--domain_constraint', default='state', choices=['none', 'position', 'state'],
+    parser.add_argument('--domain_constraint', default='none', choices=['none', 'position', 'state'],
                         help='Reject MPC candidates whose own drone leaves the training domain before the game ends')
     parser.add_argument('--end_on_event', action=argparse.BooleanOptionalAction, default=True,
                         help='Stop each scenario at capture, target hit or exclusion breach (closed loop only)')

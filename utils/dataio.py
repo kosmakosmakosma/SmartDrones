@@ -5,7 +5,8 @@ from torch.utils.data import Dataset
 class ReachabilityDataset(Dataset):
     def __init__(self, dynamics, numpoints, pretrain, pretrain_iters, tMin, tMax, counter_start, counter_end, num_src_samples, num_target_samples,
                  learned_boundary_fraction=0.5, geometric_boundary_fraction=0.2, learned_boundary_update_epochs=1000,
-                 learned_boundary_candidate_samples=100000, learned_boundary_keep_samples=10000, learned_boundary_buffer_size=100000):
+                 learned_boundary_candidate_samples=100000, learned_boundary_keep_samples=10000, learned_boundary_buffer_size=100000,
+                 capture_fraction=0.0, mpc_fraction=0.0, pretrain_geometric_fraction=0.0):
         self.dynamics = dynamics
         self.numpoints = numpoints
         self.pretrain = pretrain
@@ -24,6 +25,14 @@ class ReachabilityDataset(Dataset):
         self.learned_boundary_keep_samples = learned_boundary_keep_samples
         self.learned_boundary_buffer_size = learned_boundary_buffer_size
         self.learned_boundary_coords = None
+        # capture_fraction: share of each post-pretraining batch placed at the capture distance
+        # mpc_fraction: share taken from MPC replay states (PDE points that also carry value labels);
+        #   requires mpc_sampler(count, max_time) -> (times, states, values) in real units, or None
+        # pretrain_geometric_fraction: share of each pretraining batch on the target/exclusion circles
+        self.capture_fraction = capture_fraction
+        self.mpc_fraction = mpc_fraction
+        self.pretrain_geometric_fraction = pretrain_geometric_fraction
+        self.mpc_sampler = None
 
     def add_learned_boundary_samples(self, model_coords):
         model_coords = model_coords.detach().cpu()
@@ -67,8 +76,24 @@ class ReachabilityDataset(Dataset):
             return torch.full((num_samples, 1), self.tMin)
         return self.tMin + torch.zeros(num_samples, 1).uniform_(0, self._current_t_max() - self.tMin)
 
+    def _sample_uniform_states(self, num_samples):
+        if hasattr(self.dynamics, 'sample_model_states'):
+            return self.dynamics.sample_model_states(num_samples)   # velocities inside speed disks
+        return torch.zeros(num_samples, self.dynamics.state_dim).uniform_(-1, 1)
+
+    def _sample_capture_states(self, num_samples):
+        """Defender at the capture distance (+-3 cm) from the attacker in a random direction."""
+        model_states = self._sample_uniform_states(num_samples)
+        states = self.dynamics.input_to_coord(torch.cat((torch.zeros(num_samples, 1), model_states), dim=1))[:, 1:]
+        angles = 2 * torch.pi * torch.rand(num_samples)
+        radii = self.dynamics.capture_R + 0.03 * torch.randn(num_samples)
+        states[:, 4] = states[:, 0] + radii * torch.cos(angles)
+        states[:, 6] = states[:, 2] + radii * torch.sin(angles)
+        model_states = self.dynamics.coord_to_input(torch.cat((torch.zeros(num_samples, 1), states), dim=1))[:, 1:]
+        return torch.clamp(model_states, -1.0, 1.0)
+
     def _sample_geometric_boundary_states(self, num_samples):
-        model_states = torch.zeros(num_samples, self.dynamics.state_dim).uniform_(-1, 1)
+        model_states = self._sample_uniform_states(num_samples)
         if not all(hasattr(self.dynamics, name) for name in ['target_R', 'capture_R']):
             return model_states
 
@@ -104,32 +129,59 @@ class ReachabilityDataset(Dataset):
     def __len__(self):
         return 1
 
+    def _sample_mpc_coords(self, num_samples):
+        """MPC replay states with time-to-go <= the current curriculum time, as model coords + labels."""
+        if num_samples <= 0 or self.mpc_sampler is None:
+            return None, None
+        sample = self.mpc_sampler(num_samples, self._current_t_max())
+        if sample is None:
+            return None, None
+        times, states, values = (tensor.detach().cpu().float() for tensor in sample)
+        coords = self.dynamics.coord_to_input(torch.cat((times.reshape(-1, 1), states), dim=1))
+        return coords[:, :1 + self.dynamics.state_dim], values.reshape(-1)
+
     def __getitem__(self, idx):
         # uniformly sample domain and include coordinates where source is non-zero 
-        num_geometric = 0 if self.pretrain else int(self.numpoints * self.geometric_boundary_fraction)
-        num_learned = 0 if self.pretrain else int(self.numpoints * self.learned_boundary_fraction)
+        if self.pretrain:
+            num_geometric = int(self.numpoints * self.pretrain_geometric_fraction)
+            num_learned = num_capture = num_mpc = 0
+        else:
+            num_geometric = int(self.numpoints * self.geometric_boundary_fraction)
+            num_learned = int(self.numpoints * self.learned_boundary_fraction)
+            num_capture = int(self.numpoints * self.capture_fraction)
+            num_mpc = int(self.numpoints * self.mpc_fraction)
         learned_coords = self._sample_learned_boundary_coords(num_learned) if num_learned else None
         if learned_coords is None:
             num_learned = 0
+        mpc_coords, mpc_values = self._sample_mpc_coords(num_mpc)
+        if mpc_coords is None:   # no MPC data yet: fill with uniform points instead
+            num_mpc = 0
 
-        num_uniform = self.numpoints - num_geometric - num_learned
-        model_states = torch.zeros(num_uniform, self.dynamics.state_dim).uniform_(-1, 1)
+        num_uniform = self.numpoints - num_geometric - num_learned - num_capture - num_mpc
+        model_states = self._sample_uniform_states(num_uniform)
         if num_geometric:
             model_states = torch.cat((model_states, self._sample_geometric_boundary_states(num_geometric)), dim=0)
+        if num_capture:
+            model_states = torch.cat((model_states, self._sample_capture_states(num_capture)), dim=0)
         if self.num_target_samples > 0:
             target_state_samples = self.dynamics.sample_target_state(self.num_target_samples)
             model_states[-self.num_target_samples:] = self.dynamics.coord_to_input(torch.cat((torch.zeros(self.num_target_samples, 1), target_state_samples), dim=-1))[:, 1:self.dynamics.state_dim+1]
 
         times = self._sample_times(model_states.shape[0])
+        if not self.pretrain:
+            # make sure we always have training samples at the initial time (taken from the uniform points)
+            times[:min(self.num_src_samples, num_uniform), 0] = self.tMin
         model_coords = torch.cat((times, model_states), dim=1)
         if learned_coords is not None:
             model_coords = torch.cat((model_coords, learned_coords), dim=0)
-        if not self.pretrain:
-            # make sure we always have training samples at the initial time
-            times[-self.num_src_samples:, 0] = self.tMin
-            model_coords[-self.num_src_samples:, 0] = self.tMin
+        mpc_mask = torch.zeros(model_coords.shape[0], dtype=torch.bool)
+        mpc_targets = torch.zeros(model_coords.shape[0])
+        if mpc_coords is not None:
+            model_coords = torch.cat((model_coords, mpc_coords), dim=0)
+            mpc_mask = torch.cat((mpc_mask, torch.ones(mpc_coords.shape[0], dtype=torch.bool)))
+            mpc_targets = torch.cat((mpc_targets, mpc_values))
         if self.dynamics.input_dim > self.dynamics.state_dim + 1: # temporary workaround for having to deal with dynamics classes for parametrized models with extra inputs
-            model_coords = torch.cat((model_coords, torch.zeros(self.numpoints, self.dynamics.input_dim - self.dynamics.state_dim - 1)), dim=1)      
+            model_coords = torch.cat((model_coords, torch.zeros(model_coords.shape[0], self.dynamics.input_dim - self.dynamics.state_dim - 1)), dim=1)      
 
         boundary_values = self.dynamics.boundary_fn(self.dynamics.input_to_coord(model_coords)[..., 1:])
         if self.dynamics.loss_type == 'brat_hjivi':
@@ -150,9 +202,10 @@ class ReachabilityDataset(Dataset):
         if self.pretrain and self.pretrain_counter == self.pretrain_iters:
             self.pretrain = False
 
+        mpc_gt = {'mpc_mask': mpc_mask, 'mpc_targets': mpc_targets}
         if self.dynamics.loss_type == 'brt_hjivi':
-            return {'model_coords': model_coords}, {'boundary_values': boundary_values, 'dirichlet_masks': dirichlet_masks}
+            return {'model_coords': model_coords}, {'boundary_values': boundary_values, 'dirichlet_masks': dirichlet_masks, **mpc_gt}
         elif self.dynamics.loss_type == 'brat_hjivi':
-            return {'model_coords': model_coords}, {'boundary_values': boundary_values, 'reach_values': reach_values, 'avoid_values': avoid_values, 'dirichlet_masks': dirichlet_masks}
+            return {'model_coords': model_coords}, {'boundary_values': boundary_values, 'reach_values': reach_values, 'avoid_values': avoid_values, 'dirichlet_masks': dirichlet_masks, **mpc_gt}
         else:
             raise NotImplementedError

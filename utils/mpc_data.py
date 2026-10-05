@@ -44,6 +44,14 @@ class MPCReplayBuffer:
             self.values[indices].to(device),
         )
 
+    def sample_up_to_time(self, batch_size: int, max_time: float, generator: torch.Generator = None):
+        """Like sample, restricted to labels with time-to-go <= max_time; None if there are none (CPU tensors)."""
+        eligible = torch.nonzero(self.times <= max_time + 1e-6).squeeze(-1)
+        if eligible.numel() == 0:
+            return None
+        indices = eligible[torch.randint(eligible.numel(), (batch_size,), generator=generator)]
+        return self.times[indices], self.states[indices], self.values[indices]
+
     def state_dict(self):
         return {"times": self.times, "states": self.states, "values": self.values}
 

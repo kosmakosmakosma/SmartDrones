@@ -1,4 +1,5 @@
 import wandb
+import copy
 import torch
 import os
 import shutil
@@ -114,9 +115,15 @@ class Experiment(ABC):
             attacker_boundary_std=0.2, attacker_velocity='uniform',
             attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
             time_distribution='uniform', rollout='open_loop', replan_every=1,
-            end_on_event=False, game_solver='alternating', use_network=True, crop_to_domain=False):
+            end_on_event=False, game_solver='alternating', use_network=True, crop_to_domain=False,
+            labels_per_refresh=None):
         """Generate BRAT MPC labels against the current policy and add bootstrapped trajectory suffixes to `replay_buffer`."""
         dynamics = self.dataset.dynamics
+        if getattr(dynamics, 'box_loses', False):
+            # the MPC players may leave the box (their labels are cropped to the domain instead);
+            # only the network's game ends at the box
+            dynamics = copy.copy(dynamics)
+            dynamics.box_loses = False
         required_methods = ('reach_fn', 'avoid_fn', 'optimal_control', 'optimal_disturbance')
         if not all(hasattr(dynamics, name) for name in required_methods):
             raise NotImplementedError(
@@ -217,6 +224,13 @@ class Experiment(ABC):
             keep = torch.arange(horizon_plus_one, device=label_times.device)[None] <= event_steps[:, None]
         if crop_to_domain:   # labels were computed over the full game; only in-domain states are stored
             keep = keep & in_domain_mask(dynamics, result.states)
+        # states after the time-to-go ran out are frozen copies of the last one: keep only the first
+        step_times = torch.arange(horizon_plus_one, device=label_times.device)[None] * mpc_config.dt
+        keep = keep & (step_times <= times[:, None] + 1e-6)
+        if labels_per_refresh is not None and int(keep.sum()) > labels_per_refresh:
+            kept = torch.nonzero(keep.reshape(-1)).squeeze(-1)
+            chosen = kept[torch.randperm(kept.numel(), device=kept.device)[:labels_per_refresh]]
+            keep = torch.zeros_like(keep.reshape(-1)).index_fill_(0, chosen, True).view_as(keep)
         replay_buffer.add(
             label_times[keep].detach().cpu(),
             result.states[keep].reshape(-1, dynamics.state_dim).detach().cpu(),
@@ -329,7 +343,7 @@ class Experiment(ABC):
 
         num_candidates = self.dataset.learned_boundary_candidate_samples
         keep_count = min(self.dataset.learned_boundary_keep_samples, num_candidates)
-        model_states = torch.zeros(num_candidates, self.dataset.dynamics.state_dim).uniform_(-1, 1)
+        model_states = self.dataset._sample_uniform_states(num_candidates)
         times = self.dataset._sample_times(num_candidates)
         model_coords = torch.cat((times, model_states), dim=1)
         if self.dataset.dynamics.input_dim > self.dataset.dynamics.state_dim + 1:
@@ -370,6 +384,7 @@ class Experiment(ABC):
             mpc_attacker_speed_max=None, mpc_time_distribution='uniform',
             mpc_rollout='open_loop', mpc_replan_every=1, mpc_end_on_event=False,
             mpc_game_solver='alternating', mpc_use_network=True, mpc_crop_to_domain=False,
+            mpc_labels_per_refresh=None,
             mpc_loss_weight=1.0, mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
         ):
@@ -390,6 +405,9 @@ class Experiment(ABC):
             if mpc_seed is not None:
                 mpc_generator = torch.Generator(device=device)
                 mpc_generator.manual_seed(mpc_seed)
+            if getattr(self.dataset, 'mpc_fraction', 0) > 0:
+                # MPC replay states become part of every batch (PDE points with value labels)
+                self.dataset.mpc_sampler = mpc_replay_buffer.sample_up_to_time
 
         train_dataloader = DataLoader(self.dataset, shuffle=True, batch_size=batch_size, pin_memory=True, num_workers=0)
 
@@ -485,7 +503,8 @@ class Experiment(ABC):
                             mpc_attacker_velocity, mpc_attacker_velocity_spread_deg,
                             mpc_attacker_speed_max, mpc_time_distribution,
                             mpc_rollout, mpc_replan_every, mpc_end_on_event,
-                            mpc_game_solver, mpc_use_network, mpc_crop_to_domain)
+                            mpc_game_solver, mpc_use_network, mpc_crop_to_domain,
+                            mpc_labels_per_refresh)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)
@@ -516,7 +535,12 @@ class Experiment(ABC):
                     else:
                         raise NotImplementedError
 
-                    if use_mpc_guidance and len(mpc_replay_buffer) > 0:
+                    mpc_mask = gt.get('mpc_mask')
+                    if use_mpc_guidance and mpc_mask is not None and bool(mpc_mask.any()):
+                        # MPC states are part of the batch (PDE residual above) and also carry value labels
+                        losses['mpc_data'] = mpc_loss_weight * torch.mean(
+                            (values[mpc_mask] - gt['mpc_targets'][mpc_mask]) ** 2)
+                    elif use_mpc_guidance and getattr(self.dataset, 'mpc_fraction', 0) == 0 and len(mpc_replay_buffer) > 0:
                         mpc_times, mpc_states, mpc_targets = mpc_replay_buffer.sample(mpc_batch_size, device)
                         mpc_coords = torch.cat((mpc_times.unsqueeze(-1), mpc_states), dim=-1)
                         if self.dataset.dynamics.input_dim > self.dataset.dynamics.state_dim + 1:

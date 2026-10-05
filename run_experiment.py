@@ -58,6 +58,9 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--num_target_samples', type=int, default=0, required=False, help='Number of samples inside the target set')
     p.add_argument('--learned_boundary_fraction', type=float, default=0.5, required=False, help='Fraction of each post-pretrain batch sampled near the current learned V=0 boundary')
     p.add_argument('--geometric_boundary_fraction', type=float, default=0.2, required=False, help='Fraction of each post-pretrain batch sampled near target and exclusion geometry')
+    p.add_argument('--capture_fraction', type=float, default=0.0, required=False, help='Fraction of each post-pretraining batch with the defender at the capture distance from the attacker')
+    p.add_argument('--mpc_fraction', type=float, default=0.0, required=False, help='Fraction of each post-pretraining batch taken from MPC replay states (PDE points that also get the MPC value loss)')
+    p.add_argument('--pretrain_geometric_fraction', type=float, default=0.0, required=False, help='Fraction of each pretraining batch on the target / defender exclusion circles')
     p.add_argument('--learned_boundary_update_epochs', type=int, default=1000, required=False, help='Epochs between learned-boundary replay refreshes')
     p.add_argument('--learned_boundary_candidate_samples', type=int, default=100000, required=False, help='Candidate states evaluated during each learned-boundary refresh')
     p.add_argument('--learned_boundary_keep_samples', type=int, default=10000, required=False, help='Best near-boundary candidates added to replay at each refresh')
@@ -118,6 +121,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_domain_constraint', type=str, default='none', choices=['none', 'position', 'state'], help="Reject MPC candidates whose own drone leaves the training domain before the game ends: 'position' (x/y), 'state' (also velocities) or 'none'")
     p.add_argument('--mpc_defender_keep_out', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Reject defender MPC plans that enter the defender exclusion zone (the breach still counts as an attacker win in labels)')
     p.add_argument('--mpc_crop_to_domain', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Store only MPC labels whose state lies inside the training domain (labels are still computed over the full game)')
+    p.add_argument('--mpc_labels_per_refresh', type=int, default=None, help='Store at most this many (randomly chosen) labels per MPC refresh')
     p.add_argument('--mpc_game_solver', type=str, default='maxmin', choices=['alternating', 'maxmin', 'mixed'], help="Joint MPC planner: 'maxmin' scores every attacker x defender plan pair and each player keeps its best worst-case plan; 'mixed' solves that table as a matrix game and samples each player's plan from its equilibrium mixture; 'alternating' best-responds to the opponent's current plan")
     p.add_argument('--mpc_use_network', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='false: joint MPC uses no network at all (zero initial plans, terminal-set margin as terminal value)')
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
@@ -167,8 +171,9 @@ if opt.additional_epochs < 0:
     p.error('--additional_epochs must be non-negative')
 if opt.additional_epochs and not opt.resume:
     p.error('--additional_epochs requires --resume')
-if hasattr(opt, 'learned_boundary_fraction') and opt.learned_boundary_fraction + opt.geometric_boundary_fraction > 1.0:
-    p.error('--learned_boundary_fraction plus --geometric_boundary_fraction must be at most 1.0')
+if hasattr(opt, 'learned_boundary_fraction') and (opt.learned_boundary_fraction + opt.geometric_boundary_fraction
+                                                   + opt.capture_fraction + opt.mpc_fraction) > 1.0:
+    p.error('--learned_boundary_fraction + --geometric_boundary_fraction + --capture_fraction + --mpc_fraction must be at most 1.0')
 
 experiment_dir = os.path.join(opt.experiments_dir, opt.experiment_name)
 if (mode == 'all') or (mode == 'train'):
@@ -246,7 +251,10 @@ dataset = dataio.ReachabilityDataset(
     learned_boundary_update_epochs=getattr(opt, 'learned_boundary_update_epochs', getattr(orig_opt, 'learned_boundary_update_epochs', 1000)),
     learned_boundary_candidate_samples=getattr(opt, 'learned_boundary_candidate_samples', getattr(orig_opt, 'learned_boundary_candidate_samples', 100000)),
     learned_boundary_keep_samples=getattr(opt, 'learned_boundary_keep_samples', getattr(orig_opt, 'learned_boundary_keep_samples', 10000)),
-    learned_boundary_buffer_size=getattr(opt, 'learned_boundary_buffer_size', getattr(orig_opt, 'learned_boundary_buffer_size', 100000)))
+    learned_boundary_buffer_size=getattr(opt, 'learned_boundary_buffer_size', getattr(orig_opt, 'learned_boundary_buffer_size', 100000)),
+    capture_fraction=getattr(opt, 'capture_fraction', getattr(orig_opt, 'capture_fraction', 0.0)),
+    mpc_fraction=getattr(opt, 'mpc_fraction', getattr(orig_opt, 'mpc_fraction', 0.0)),
+    pretrain_geometric_fraction=getattr(opt, 'pretrain_geometric_fraction', getattr(orig_opt, 'pretrain_geometric_fraction', 0.0)))
 
 model = modules.SingleBVPNet(in_features=dynamics.input_dim, out_features=1, type=orig_opt.model, mode=orig_opt.model_mode,
                              final_layer_factor=1., hidden_features=orig_opt.num_nl, num_hidden_layers=orig_opt.num_hl)
@@ -326,6 +334,7 @@ if (mode == 'all') or (mode == 'train'):
         mpc_game_solver=getattr(mpc_options, 'mpc_game_solver', 'alternating'),
         mpc_use_network=getattr(mpc_options, 'mpc_use_network', True),
         mpc_crop_to_domain=getattr(mpc_options, 'mpc_crop_to_domain', False),
+        mpc_labels_per_refresh=getattr(mpc_options, 'mpc_labels_per_refresh', None),
         mpc_batch_size=getattr(mpc_options, 'mpc_batch_size', 1000), mpc_loss_weight=getattr(mpc_options, 'mpc_loss_weight', 1.0),
         mpc_seed=getattr(mpc_options, 'mpc_seed', None),
         mpc_initial_guess=getattr(mpc_options, 'mpc_initial_guess', 'network'),

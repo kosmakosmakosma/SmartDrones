@@ -76,7 +76,7 @@ def main():
                         help='Acceleration limit per axis in m/s^2, the same for both players '
                              '(<= 0: keep the experiment values, or 5 / 7 without an experiment)')
     parser.add_argument('--vel_max_d', type=float, default=3.0, help='Defender speed limit in m/s (<= 0: unlimited)')
-    parser.add_argument('--vel_max_a_ratio', type=float, default=0.8,
+    parser.add_argument('--vel_max_a_ratio', type=float, default=1.0,
                         help='Attacker speed limit as a fraction of the defender limit')
     parser.add_argument('--tMax', type=float, default=None, help='Time-to-go of every scenario (default: experiment tMax)')
     parser.add_argument('--num_initial_states', type=int, default=300)
@@ -92,7 +92,7 @@ def main():
     parser.add_argument('--initial_guess', default='network', choices=['network', 'zero'])
     parser.add_argument('--dt', type=float, default=0.02)
     parser.add_argument('--horizon_steps', type=int, default=50)
-    parser.add_argument('--num_samples', type=int, default=32)
+    parser.add_argument('--num_samples', type=int, default=64)
     parser.add_argument('--iterations', type=int, default=3)
     parser.add_argument('--control_hold_steps', type=int, default=10)
     parser.add_argument('--noise_fraction', type=float, default=0.25)

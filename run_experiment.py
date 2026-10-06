@@ -121,6 +121,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_domain_constraint', type=str, default='none', choices=['none', 'position', 'state'], help="Reject MPC candidates whose own drone leaves the training domain before the game ends: 'position' (x/y), 'state' (also velocities) or 'none'")
     p.add_argument('--mpc_defender_keep_out', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Reject defender MPC plans that enter the defender exclusion zone (the breach still counts as an attacker win in labels)')
     p.add_argument('--mpc_crop_to_domain', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Store only MPC labels whose state lies inside the training domain (labels are still computed over the full game)')
+    p.add_argument('--mpc_loss_type', type=str, default='l1', choices=['l1', 'l2'], help="MPC value loss: 'l1' mean |V - label| (constant pull per label, like the PDE residual) or 'l2' mean squared error")
     p.add_argument('--mpc_labels_per_refresh', type=int, default=None, help='Store at most this many (randomly chosen) labels per MPC refresh')
     p.add_argument('--mpc_game_solver', type=str, default='maxmin', choices=['alternating', 'maxmin', 'mixed'], help="Joint MPC planner: 'maxmin' scores every attacker x defender plan pair and each player keeps its best worst-case plan; 'mixed' solves that table as a matrix game and samples each player's plan from its equilibrium mixture; 'alternating' best-responds to the opponent's current plan")
     p.add_argument('--mpc_use_network', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='false: joint MPC uses no network at all (zero initial plans, terminal-set margin as terminal value)')
@@ -336,6 +337,7 @@ if (mode == 'all') or (mode == 'train'):
         mpc_crop_to_domain=getattr(mpc_options, 'mpc_crop_to_domain', False),
         mpc_labels_per_refresh=getattr(mpc_options, 'mpc_labels_per_refresh', None),
         mpc_batch_size=getattr(mpc_options, 'mpc_batch_size', 1000), mpc_loss_weight=getattr(mpc_options, 'mpc_loss_weight', 1.0),
+        mpc_loss_type=getattr(mpc_options, 'mpc_loss_type', 'l2'),
         mpc_seed=getattr(mpc_options, 'mpc_seed', None),
         mpc_initial_guess=getattr(mpc_options, 'mpc_initial_guess', 'network'),
         mpc_optimized_player=getattr(mpc_options, 'mpc_optimized_player', 'attacker'))

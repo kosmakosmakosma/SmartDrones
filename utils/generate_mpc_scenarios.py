@@ -19,7 +19,7 @@ import torch
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import MPCConfig, closed_loop_rollout, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
 from dynamics import dynamics as dynamics_module
-from utils.mpc_data import in_domain_mask, mpc_domain_constraint, sample_mpc_initial_states
+from utils.mpc_data import in_domain_mask, mpc_domain_constraint, mpc_label_times, sample_mpc_initial_states
 
 
 def load_experiment(experiments_dir, experiment_name, checkpoint, device, defender_exclusion_R,
@@ -180,7 +180,7 @@ def main():
         parser.error("open_loop is only supported here for --optimized_player joint")
 
     steps = result.states.shape[1]
-    label_times = torch.stack([torch.clamp(times - k * args.dt, min=0.0) for k in range(steps)], dim=1)
+    label_times = mpc_label_times(dynamics, result, times, args.dt)   # time-to-go measured to the event
     # Labels cover the full game; training stores only in-domain states (--mpc_crop_to_domain).
     # The file keeps whole trajectories for the viewer plus the mask of states training would keep.
     in_domain = in_domain_mask(dynamics, result.states)

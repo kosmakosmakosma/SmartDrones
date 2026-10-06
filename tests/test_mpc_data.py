@@ -307,3 +307,16 @@ def test_batch_composition_capture_mpc_and_pretraining():
     capture = real[300:400]                                       # uniform 300, then capture 100, then MPC 200
     assert torch.all(((capture[:, [0, 2]] - capture[:, [4, 6]]).norm(dim=-1) - 0.2).abs() < 0.2)
     assert torch.all(coords[:10, 0] == 0)                         # t = 0 points come from the uniform block
+
+
+def test_label_times_are_measured_to_the_event():
+    from utils.mpc_data import mpc_label_times
+    dyn = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2)
+    states = torch.zeros(2, 6, 8)
+    states[..., 0] = 1.5                      # attacker far from the target
+    states[..., 4] = -1.5                     # defender far away: no event
+    states[0, 3:, 4] = 1.6                    # scenario 0: defender within capture distance from step 3 on
+    result = SimpleNamespace(states=states, event_steps=torch.tensor([3, 5]))
+    times = mpc_label_times(dyn, result, torch.tensor([1.0, 0.1]), 0.02)
+    assert torch.allclose(times[0, :4], torch.tensor([0.06, 0.04, 0.02, 0.0]))    # counted down to the capture
+    assert torch.allclose(times[1], torch.clamp(0.1 - 0.02 * torch.arange(6), min=0.0))   # ran out of time

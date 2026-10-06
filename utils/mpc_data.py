@@ -184,3 +184,24 @@ def in_domain_mask(dynamics, states):
     mean = dynamics.state_mean.to(dtype=states.dtype, device=states.device)
     var = dynamics.state_var.to(dtype=states.dtype, device=states.device)
     return ((states - mean).abs() <= var + 1e-6).all(dim=-1)
+
+
+def mpc_label_times(dynamics, result, initial_times, dt):
+    """Time-to-go attached to every state of MPC trajectories [B, H+1].
+
+    A game that ended at an event (capture, target hit, breach) is labelled as a game that ends exactly
+    at that event: the state k steps before the event gets time-to-go k * dt, so the event state itself
+    gets 0. Its label (the reach-avoid score with the event state's terminal margin) is then the value
+    of exactly that game, which is what the network's V(t, x) means. Games that ran out of time keep
+    their real time-to-go.
+    """
+    steps = result.states.shape[1]
+    step_index = torch.arange(steps, device=result.states.device)[None]
+    label_times = torch.clamp(initial_times.reshape(-1, 1) - step_index * dt, min=0.0)
+    event_steps = getattr(result, 'event_steps', None)
+    if event_steps is None:
+        return label_times
+    event_states = result.states[torch.arange(result.states.shape[0], device=result.states.device), event_steps]
+    ended_by_event = (dynamics.reach_fn(event_states) <= 0) | (dynamics.avoid_fn(event_states) <= 0)
+    to_event = torch.clamp((event_steps[:, None] - step_index) * dt, min=0.0)
+    return torch.where(ended_by_event[:, None], to_event, label_times)

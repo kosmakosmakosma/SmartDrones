@@ -25,7 +25,7 @@ from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
-from utils.mpc_data import in_domain_mask, sample_mpc_initial_states, sample_mpc_initial_times
+from utils.mpc_data import in_domain_mask, mpc_label_times, sample_mpc_initial_states, sample_mpc_initial_times
 
 
 class Experiment(ABC):
@@ -215,8 +215,7 @@ class Experiment(ABC):
             raise ValueError("optimized_player must be 'attacker', 'defender', or 'joint'")
 
         horizon_plus_one = result.states.shape[1]
-        label_times = torch.stack(
-            [torch.clamp(times - step * mpc_config.dt, min=0.0) for step in range(horizon_plus_one)], dim=1)
+        label_times = mpc_label_times(dynamics, result, times, mpc_config.dt)
 
         keep = torch.ones_like(label_times, dtype=torch.bool)
         event_steps = getattr(result, 'event_steps', None)
@@ -385,7 +384,7 @@ class Experiment(ABC):
             mpc_rollout='open_loop', mpc_replan_every=1, mpc_end_on_event=False,
             mpc_game_solver='alternating', mpc_use_network=True, mpc_crop_to_domain=False,
             mpc_labels_per_refresh=None,
-            mpc_loss_weight=1.0, mpc_seed=None, mpc_initial_guess='network',
+            mpc_loss_weight=1.0, mpc_loss_type='l2', mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
         ):
         was_eval = not self.model.training
@@ -408,6 +407,13 @@ class Experiment(ABC):
             if getattr(self.dataset, 'mpc_fraction', 0) > 0:
                 # MPC replay states become part of every batch (PDE points with value labels)
                 self.dataset.mpc_sampler = mpc_replay_buffer.sample_up_to_time
+
+        if mpc_loss_type not in ('l1', 'l2'):
+            raise ValueError("mpc_loss_type must be 'l1' or 'l2'")
+
+        def mpc_label_loss(errors):
+            # l1: every label pulls with constant strength (like the PDE residual); l2: squared error
+            return torch.mean(torch.abs(errors)) if mpc_loss_type == 'l1' else torch.mean(errors ** 2)
 
         train_dataloader = DataLoader(self.dataset, shuffle=True, batch_size=batch_size, pin_memory=True, num_workers=0)
 
@@ -538,8 +544,8 @@ class Experiment(ABC):
                     mpc_mask = gt.get('mpc_mask')
                     if use_mpc_guidance and mpc_mask is not None and bool(mpc_mask.any()):
                         # MPC states are part of the batch (PDE residual above) and also carry value labels
-                        losses['mpc_data'] = mpc_loss_weight * torch.mean(
-                            (values[mpc_mask] - gt['mpc_targets'][mpc_mask]) ** 2)
+                        losses['mpc_data'] = mpc_loss_weight * mpc_label_loss(
+                            values[mpc_mask] - gt['mpc_targets'][mpc_mask])
                     elif use_mpc_guidance and getattr(self.dataset, 'mpc_fraction', 0) == 0 and len(mpc_replay_buffer) > 0:
                         mpc_times, mpc_states, mpc_targets = mpc_replay_buffer.sample(mpc_batch_size, device)
                         mpc_coords = torch.cat((mpc_times.unsqueeze(-1), mpc_states), dim=-1)
@@ -550,7 +556,7 @@ class Experiment(ABC):
                         mpc_model_input = self.dataset.dynamics.coord_to_input(mpc_coords)
                         mpc_results = self.model({'coords': mpc_model_input})
                         mpc_preds = self.dataset.dynamics.io_to_value(mpc_results['model_in'], mpc_results['model_out'].squeeze(dim=-1))
-                        losses['mpc_data'] = mpc_loss_weight * torch.mean((mpc_preds - mpc_targets) ** 2)
+                        losses['mpc_data'] = mpc_loss_weight * mpc_label_loss(mpc_preds - mpc_targets)
                     
                     if use_lbfgs:
                         def closure():

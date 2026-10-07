@@ -386,6 +386,7 @@ class Experiment(ABC):
             mpc_labels_per_refresh=None,
             mpc_loss_weight=1.0, mpc_loss_type='l2', mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
+            lr_final=None, lr_decay_start_epoch=None, resume_lr=None,
         ):
         was_eval = not self.model.training
         self.model.train()
@@ -479,6 +480,11 @@ class Experiment(ABC):
             elif use_mpc_guidance and mpc_reset_replay:
                 print('Resetting saved MPC replay buffer for resumed training')
             print('Resuming training from completed epoch %d' % start_epoch)
+            if resume_lr is not None:
+                lr = resume_lr   # the saved optimizer state carries the old learning rate: override it
+                for param_group in optim.param_groups:
+                    param_group['lr'] = lr
+                print('Learning rate set to %g for resumed training' % lr)
 
         target_epochs = epochs + additional_epochs
         if start_epoch > target_epochs:
@@ -488,8 +494,20 @@ class Experiment(ABC):
         if additional_epochs:
             print('Refining at the full horizon through epoch %d' % target_epochs)
 
+        def scheduled_lr(epoch):
+            """Constant lr until lr_decay_start_epoch, then exponential decay reaching lr_final at the last epoch."""
+            if lr_final is None or lr_decay_start_epoch is None or epoch < lr_decay_start_epoch:
+                return lr
+            span = max(target_epochs - lr_decay_start_epoch, 1)
+            progress = min((epoch - lr_decay_start_epoch) / span, 1.0)
+            return lr * (lr_final / lr) ** progress
+
         with tqdm(total=len(train_dataloader) * target_epochs, initial=len(train_dataloader) * start_epoch) as pbar:
             for epoch in range(start_epoch, target_epochs):
+                current_lr = scheduled_lr(epoch)
+                if lr_final is not None:
+                    for param_group in optim.param_groups:
+                        param_group['lr'] = current_lr
                 if (not self.dataset.pretrain and
                         self.dataset.learned_boundary_fraction > 0 and
                         not epoch % self.dataset.learned_boundary_update_epochs):
@@ -651,6 +669,7 @@ class Experiment(ABC):
                                 'step': epoch,
                                 'train_loss': train_loss,
                                 'pde_loss': losses['diff_constraint_hom'],
+                                'lr': optim.param_groups[0]['lr'],
                             }
                             if 'mpc_data' in losses:
                                 wandb_metrics['mpc_data_loss'] = losses['mpc_data']

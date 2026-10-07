@@ -79,6 +79,9 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--autosave_epochs', type=int, default=10, help='Save resumable training state every N completed epochs.')
     p.add_argument('--batch_size', type=int, default=1, help='Batch size used during training (irrelevant, since len(dataset) == 1).')
     p.add_argument('--lr', type=float, default=1e-4, help='learning rate. default=1e-4')
+    p.add_argument('--lr_final', type=float, default=None, help='If set, the learning rate decays exponentially from --lr to this value between --lr_decay_start_epoch and the last epoch')
+    p.add_argument('--lr_decay_start_epoch', type=int, default=None, help='Epoch at which the decay starts (default: end of pretraining + curriculum)')
+    p.add_argument('--resume_lr', type=float, default=None, help='Learning rate to use when resuming (overrides the saved one); the decay to --lr_final then starts from it')
     p.add_argument('--num_epochs', type=int, default=100000, help='Number of epochs to train for.')
     p.add_argument('--clip_grad', default=0.0, type=float, help='Clip gradient.')
     p.add_argument('--use_lbfgs', default=False, type=bool, help='use L-BFGS.')
@@ -317,6 +320,12 @@ if (mode == 'all') or (mode == 'train'):
         val_x_resolution=orig_opt.val_x_resolution, val_y_resolution=orig_opt.val_y_resolution, val_z_resolution=orig_opt.val_z_resolution, val_time_resolution=orig_opt.val_time_resolution,
         use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size,
         resume=opt.resume, autosave_epochs=opt.autosave_epochs, additional_epochs=opt.additional_epochs,
+        lr_final=opt.lr_final if opt.lr_final is not None else getattr(orig_opt, 'lr_final', None),
+        lr_decay_start_epoch=(opt.lr_decay_start_epoch if opt.lr_decay_start_epoch is not None
+                              else getattr(orig_opt, 'lr_decay_start_epoch', None)
+                              if getattr(orig_opt, 'lr_decay_start_epoch', None) is not None
+                              else (orig_opt.pretrain_iters if orig_opt.pretrain else 0) + orig_opt.counter_end),
+        resume_lr=opt.resume_lr if opt.resume else None,
         use_mpc_guidance=use_mpc_guidance, mpc_config=mpc_config, mpc_replay_buffer=mpc_replay_buffer,
         mpc_num_initial_states=getattr(mpc_options, 'mpc_num_initial_states', 256),
         mpc_start_epoch=getattr(mpc_options, 'mpc_start_epoch', 0),

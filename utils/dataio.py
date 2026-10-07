@@ -2,6 +2,9 @@ import torch
 from torch.utils.data import Dataset
 
 # uses model input and real boundary fn
+POINT_GROUPS = ('random', 'geometric', 'capture', 'learned', 'mpc')
+
+
 class ReachabilityDataset(Dataset):
     def __init__(self, dynamics, numpoints, pretrain, pretrain_iters, tMin, tMax, counter_start, counter_end, num_src_samples, num_target_samples,
                  learned_boundary_fraction=0.5, geometric_boundary_fraction=0.2, learned_boundary_update_epochs=1000,
@@ -154,8 +157,8 @@ class ReachabilityDataset(Dataset):
         if learned_coords is None:
             num_learned = 0
         mpc_coords, mpc_values = self._sample_mpc_coords(num_mpc)
-        if mpc_coords is None:   # no MPC data yet: fill with uniform points instead
-            num_mpc = 0
+        # at most one copy of each eligible label; slots the buffer cannot fill go to uniform points
+        num_mpc = 0 if mpc_coords is None else mpc_coords.shape[0]
 
         num_uniform = self.numpoints - num_geometric - num_learned - num_capture - num_mpc
         model_states = self._sample_uniform_states(num_uniform)
@@ -174,6 +177,9 @@ class ReachabilityDataset(Dataset):
         model_coords = torch.cat((times, model_states), dim=1)
         if learned_coords is not None:
             model_coords = torch.cat((model_coords, learned_coords), dim=0)
+        # which sampler produced each point (for logging the PDE residual per group)
+        point_group = torch.cat([torch.full((count,), group, dtype=torch.long) for group, count in enumerate(
+            (num_uniform, num_geometric, num_capture, num_learned, num_mpc))])
         mpc_mask = torch.zeros(model_coords.shape[0], dtype=torch.bool)
         mpc_targets = torch.zeros(model_coords.shape[0])
         if mpc_coords is not None:
@@ -202,7 +208,7 @@ class ReachabilityDataset(Dataset):
         if self.pretrain and self.pretrain_counter == self.pretrain_iters:
             self.pretrain = False
 
-        mpc_gt = {'mpc_mask': mpc_mask, 'mpc_targets': mpc_targets}
+        mpc_gt = {'mpc_mask': mpc_mask, 'mpc_targets': mpc_targets, 'point_group': point_group}
         if self.dynamics.loss_type == 'brt_hjivi':
             return {'model_coords': model_coords}, {'boundary_values': boundary_values, 'dirichlet_masks': dirichlet_masks, **mpc_gt}
         elif self.dynamics.loss_type == 'brat_hjivi':

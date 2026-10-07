@@ -45,11 +45,12 @@ class MPCReplayBuffer:
         )
 
     def sample_up_to_time(self, batch_size: int, max_time: float, generator: torch.Generator = None):
-        """Like sample, restricted to labels with time-to-go <= max_time; None if there are none (CPU tensors)."""
+        """Up to batch_size distinct labels with time-to-go <= max_time, drawn without replacement
+        (fewer if fewer are eligible); None if there are none. CPU tensors."""
         eligible = torch.nonzero(self.times <= max_time + 1e-6).squeeze(-1)
         if eligible.numel() == 0:
             return None
-        indices = eligible[torch.randint(eligible.numel(), (batch_size,), generator=generator)]
+        indices = eligible[torch.randperm(eligible.numel(), generator=generator)[:batch_size]]
         return self.times[indices], self.states[indices], self.values[indices]
 
     def state_dict(self):
@@ -146,13 +147,15 @@ def sample_mpc_initial_times(dataset, num_samples, distribution='uniform'):
     """Time-to-go for MPC initial states: 'uniform' follows the training curriculum, 'tmax' starts every rollout at tMax."""
     if distribution == 'uniform':
         return dataset._sample_times(num_samples).squeeze(-1)
+    if distribution == 'current_max':   # every game starts at the current curriculum maximum
+        return torch.full((num_samples,), float(dataset._current_t_max()))
     if distribution == 'tmax':
         if dataset._current_t_max() < dataset.tMax:
             raise ValueError(
                 'mpc_time_distribution=tmax requires the time curriculum to have reached tMax '
                 '(set mpc_start_epoch after pretraining and counter_end)')
         return torch.full((num_samples,), float(dataset.tMax))
-    raise ValueError("distribution must be 'uniform' or 'tmax'")
+    raise ValueError("distribution must be 'uniform', 'current_max' or 'tmax'")
 
 
 def mpc_domain_constraint(dynamics, player, mode='position', defender_keep_out=True):
@@ -205,3 +208,41 @@ def mpc_label_times(dynamics, result, initial_times, dt):
     ended_by_event = (dynamics.reach_fn(event_states) <= 0) | (dynamics.avoid_fn(event_states) <= 0)
     to_event = torch.clamp((event_steps[:, None] - step_index) * dt, min=0.0)
     return torch.where(ended_by_event[:, None], to_event, label_times)
+
+
+def outcome_metrics(predicted, label):
+    """How well predicted values match game outcomes. Sign <= 0 means attacker wins.
+
+    Returns accuracy on attacker-win games, on defender-win games, their mean (balanced accuracy,
+    which is not fooled by one outcome being much more common), the share of attacker wins, the mean
+    signed error (predicted - label; > 0 means too favourable to the defender) and the mean |error|.
+    """
+    predicted, label = predicted.reshape(-1).float(), label.reshape(-1).float()
+    attacker_wins, predicted_attacker_wins = label <= 0, predicted <= 0
+    metrics = {'count': float(label.numel()), 'attacker_win_share': attacker_wins.float().mean().item(),
+               'mean_error': (predicted - label).mean().item(),
+               'mean_abs_error': (predicted - label).abs().mean().item()}
+    rates = []
+    if attacker_wins.any():
+        metrics['attacker_win_accuracy'] = predicted_attacker_wins[attacker_wins].float().mean().item()
+        rates.append(metrics['attacker_win_accuracy'])
+    if (~attacker_wins).any():
+        metrics['defender_win_accuracy'] = (~predicted_attacker_wins[~attacker_wins]).float().mean().item()
+        rates.append(metrics['defender_win_accuracy'])
+    metrics['balanced_accuracy'] = sum(rates) / len(rates)
+    return metrics
+
+
+TIME_BINS = (0.0, 0.5, 1.0, 1.5, float('inf'))
+
+
+def abs_error_by_time(predicted, label, times, bins=TIME_BINS):
+    """Mean |predicted - label| per time-to-go bin, keyed like 't0.0-0.5'; empty bins are skipped."""
+    errors = (predicted.reshape(-1) - label.reshape(-1)).abs()
+    times = times.reshape(-1)
+    result = {}
+    for low, high in zip(bins[:-1], bins[1:]):
+        mask = (times >= low) & (times < high)
+        if mask.any():
+            result['t%.1f-%s' % (low, 'max' if high == float('inf') else '%.1f' % high)] = errors[mask].mean().item()
+    return result

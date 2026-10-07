@@ -25,7 +25,9 @@ from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
-from utils.mpc_data import in_domain_mask, mpc_label_times, sample_mpc_initial_states, sample_mpc_initial_times
+from utils.mpc_data import (MPCReplayBuffer, abs_error_by_time, in_domain_mask, mpc_label_times, outcome_metrics,
+                            sample_mpc_initial_states, sample_mpc_initial_times)
+from utils.dataio import POINT_GROUPS
 
 
 class Experiment(ABC):
@@ -116,8 +118,13 @@ class Experiment(ABC):
             attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
             time_distribution='uniform', rollout='open_loop', replan_every=1,
             end_on_event=False, game_solver='alternating', use_network=True, crop_to_domain=False,
-            labels_per_refresh=None):
-        """Generate BRAT MPC labels against the current policy and add bootstrapped trajectory suffixes to `replay_buffer`."""
+            labels_per_refresh=None, fixed_start_time=None, log_new_games=True):
+        """Play MPC games, label their states and add them to `replay_buffer` (if given).
+
+        Before the labels are added, the network's predictions on the new games are compared with their
+        outcomes (logged as mpc_new/*), since the network has not been trained on them yet.
+        Returns the kept labels and the games' starting states with their outcomes (CPU tensors).
+        """
         dynamics = self.dataset.dynamics
         if getattr(dynamics, 'box_loses', False):
             # the MPC players may leave the box (their labels are cropped to the domain instead);
@@ -135,7 +142,10 @@ class Experiment(ABC):
         self.model.eval()
         self.model.requires_grad_(False)
 
-        times = sample_mpc_initial_times(self.dataset, num_initial_states, time_distribution).to(device)
+        if fixed_start_time is not None:
+            times = torch.full((num_initial_states,), float(fixed_start_time), device=device)
+        else:
+            times = sample_mpc_initial_times(self.dataset, num_initial_states, time_distribution).to(device)
         real_states = sample_mpc_initial_states(
             dynamics, num_initial_states, state_distribution,
             defender_position_std, attacker_boundary_std, attacker_velocity,
@@ -230,24 +240,127 @@ class Experiment(ABC):
             kept = torch.nonzero(keep.reshape(-1)).squeeze(-1)
             chosen = kept[torch.randperm(kept.numel(), device=kept.device)[:labels_per_refresh]]
             keep = torch.zeros_like(keep.reshape(-1)).index_fill_(0, chosen, True).view_as(keep)
-        replay_buffer.add(
-            label_times[keep].detach().cpu(),
-            result.states[keep].reshape(-1, dynamics.state_dim).detach().cpu(),
-            result.suffix_values[keep].detach().cpu(),
-        )
+        games = {
+            'times': label_times[keep].detach().cpu(),
+            'states': result.states[keep].reshape(-1, dynamics.state_dim).detach().cpu(),
+            'values': result.suffix_values[keep].detach().cpu(),
+            'start_times': label_times[:, 0].detach().cpu(),
+            'start_states': result.states[:, 0].detach().cpu(),
+            'start_values': result.suffix_values[:, 0].detach().cpu(),
+        }
 
-        print('%s %s MPC dataset refresh: %d initial states, %d labels added, replay buffer size %d' % (
-            optimized_player.capitalize(), rollout.replace('_', '-'), num_initial_states, int(keep.sum()), len(replay_buffer)))
-        if self.use_wandb:
-            wandb.log({
-                'mpc_replay_buffer_size': len(replay_buffer),
-                'mpc_%s_mean_score' % optimized_player: result.score.mean().item(),
-            })
+        new_game_metrics = {}
+        if log_new_games:   # the network has not seen these games yet
+            start_outcome = outcome_metrics(
+                self._network_values(games['start_times'], games['start_states'], device), games['start_values'])
+            new_game_metrics = {'mpc_new/start_%s' % key: value for key, value in start_outcome.items()}
+            label_predictions = self._network_values(games['times'], games['states'], device)
+            for name, error in abs_error_by_time(label_predictions, games['values'], games['times']).items():
+                new_game_metrics['mpc_new/abs_error_%s' % name] = error
+
+        if replay_buffer is not None:
+            replay_buffer.add(games['times'], games['states'], games['values'])
+            print('%s %s MPC dataset refresh: %d initial states, %d labels added, replay buffer size %d%s' % (
+                optimized_player.capitalize(), rollout.replace('_', '-'), num_initial_states, int(keep.sum()),
+                len(replay_buffer), '' if not new_game_metrics else
+                ', network predicts the winner of new games with balanced accuracy %.2f'
+                % new_game_metrics['mpc_new/start_balanced_accuracy']))
+            if self.use_wandb:
+                wandb.log({
+                    'mpc_replay_buffer_size': len(replay_buffer),
+                    'mpc_%s_mean_score' % optimized_player: result.score.mean().item(),
+                    **new_game_metrics,
+                })
 
         for parameter, required_grad in zip(self.model.parameters(), requires_grad_flags):
             parameter.requires_grad_(required_grad)
         if was_training:
             self.model.train()
+        return games
+
+    def _network_values(self, times, states, device, batch_size=20000):
+        """V(t, x) of the current network in real units (no gradients), CPU tensor."""
+        was_training = self.model.training
+        self.model.eval()
+        dynamics = self.dataset.dynamics
+        values = []
+        for start in range(0, states.shape[0], batch_size):
+            coords = torch.cat((times[start:start + batch_size].reshape(-1, 1).float(),
+                                states[start:start + batch_size].float()), dim=1).to(device)
+            if dynamics.input_dim > dynamics.state_dim + 1:
+                coords = torch.cat((coords, torch.zeros(coords.shape[0], dynamics.input_dim - dynamics.state_dim - 1,
+                                                        device=device)), dim=1)
+            with torch.no_grad():
+                results = self.model({'coords': dynamics.coord_to_input(coords)})
+                values.append(dynamics.io_to_value(results['model_in'], results['model_out'].squeeze(dim=-1)).cpu())
+        if was_training:
+            self.model.train()
+        return torch.cat(values) if values else torch.zeros(0)
+
+    def _prepare_mpc_holdout(self, device, refresh_kwargs, num_games, seed=12345):
+        """Fixed held-out MPC games from the full time-to-go, generated once per experiment and cached."""
+        path = os.path.join(self.experiment_dir, 'training', 'mpc_holdout.pt')
+        if os.path.exists(path):
+            holdout = torch.load(path, map_location='cpu', weights_only=False)
+            print('Loaded %d held-out MPC games from %s' % (holdout['start_values'].numel(), path))
+            return holdout
+        cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=cuda_devices):   # same games for every run, training RNG untouched
+            torch.manual_seed(seed)
+            generator = torch.Generator(device=device).manual_seed(seed)
+            holdout = self._refresh_mpc_dataset(
+                device, num_initial_states=num_games, replay_buffer=None, generator=generator,
+                fixed_start_time=self.dataset.tMax, log_new_games=False,
+                **dict(refresh_kwargs, labels_per_refresh=None))
+        self._atomic_torch_save(holdout, path)
+        print('Generated %d held-out MPC games (%d labelled states) -> %s' % (
+            num_games, holdout['values'].numel(), path))
+        return holdout
+
+    def _evaluate_mpc_holdout(self, holdout, device, epoch):
+        """Network vs held-out game outcomes, on states whose time-to-go the curriculum has reached."""
+        max_time = self.dataset._current_t_max() + 1e-6
+        metrics = {'step': epoch}
+        start_mask = holdout['start_times'] <= max_time
+        if start_mask.any():
+            outcome = outcome_metrics(self._network_values(
+                holdout['start_times'][start_mask], holdout['start_states'][start_mask], device),
+                holdout['start_values'][start_mask])
+            metrics.update({'holdout/start_%s' % key: value for key, value in outcome.items()})
+        state_mask = holdout['times'] <= max_time
+        if state_mask.any():
+            predicted = self._network_values(holdout['times'][state_mask], holdout['states'][state_mask], device)
+            outcome = outcome_metrics(predicted, holdout['values'][state_mask])
+            metrics.update({'holdout/states_%s' % key: value for key, value in outcome.items()})
+            for name, error in abs_error_by_time(predicted, holdout['values'][state_mask],
+                                                 holdout['times'][state_mask]).items():
+                metrics['holdout/abs_error_%s' % name] = error
+        if 'holdout/start_balanced_accuracy' in metrics:
+            print('Held-out MPC games (epoch %d): winner balanced accuracy %.3f, mean |V - outcome| %.4f' % (
+                epoch, metrics['holdout/start_balanced_accuracy'], metrics['holdout/start_mean_abs_error']))
+        if self.use_wandb:
+            wandb.log(metrics)
+        return metrics
+
+    @staticmethod
+    def _batch_diagnostics(gt, residual_points, values, model_coords):
+        """PDE residual per point group and MPC label errors (overall and per time-to-go) for one batch."""
+        metrics = {}
+        groups = gt.get('point_group')
+        if residual_points is not None and groups is not None:
+            for index, name in enumerate(POINT_GROUPS):
+                mask = groups == index
+                if mask.any():
+                    metrics['pde_loss_%s' % name] = residual_points[mask].mean().item()
+        mpc_mask = gt.get('mpc_mask')
+        if mpc_mask is not None and mpc_mask.any():
+            predicted, labels = values[mpc_mask].detach(), gt['mpc_targets'][mpc_mask]
+            outcome = outcome_metrics(predicted, labels)
+            metrics['mpc_train/mean_error'] = outcome['mean_error']
+            metrics['mpc_train/balanced_accuracy'] = outcome['balanced_accuracy']
+            for name, error in abs_error_by_time(predicted, labels, model_coords[..., 0][mpc_mask]).items():
+                metrics['mpc_train/abs_error_%s' % name] = error
+        return metrics
 
     def validate(self, device, epoch, save_path, x_resolution, y_resolution, z_resolution, time_resolution):
         was_training = self.model.training
@@ -263,6 +376,16 @@ class Experiment(ABC):
         x_min, x_max = state_test_range[x_idx]
         y_min, y_max = state_test_range[y_idx]
         slice_min, slice_max = state_test_range[slice_idx]
+        val_slice = getattr(self, 'val_slice', None) or {'kind': 'zero_velocity'}
+        interception_slice = val_slice['kind'] == 'interception' and self.dataset.dynamics.state_dim == 8
+        attacker_speed = 0.0
+        if interception_slice:
+            # defender at rest at (px_d, 0) near the target; attacker flying straight at the target
+            slice_min, slice_max = -val_slice['defender_range'], val_slice['defender_range']
+            attacker_speed = val_slice['attacker_speed']
+            vel_max_a = getattr(self.dataset.dynamics, 'vel_max_a', None)
+            if vel_max_a is not None:
+                attacker_speed = min(attacker_speed, vel_max_a)
 
         times = torch.linspace(0, self.dataset.tMax, time_resolution)
         xs = torch.linspace(x_min, x_max, x_resolution)
@@ -280,6 +403,11 @@ class Experiment(ABC):
                 coords[:, 1 + x_idx] = xys[:, 0]
                 coords[:, 1 + y_idx] = xys[:, 1]
                 coords[:, 1 + slice_idx] = slice_values[j]
+                if interception_slice:
+                    position = xys
+                    direction = -position / torch.linalg.vector_norm(position, dim=-1, keepdim=True).clamp_min(1e-6)
+                    coords[:, 2] = attacker_speed * direction[:, 0]     # vx_a
+                    coords[:, 4] = attacker_speed * direction[:, 1]     # vy_a
 
                 with torch.no_grad():
                     model_results = self.model({'coords': self.dataset.dynamics.coord_to_input(coords.to(device))})
@@ -311,14 +439,17 @@ class Experiment(ABC):
                 if i == len(times) - 1:
                     ax.set_xlabel(plot_config['state_labels'][x_idx])
 
-        fixed_states = [
-            '%s=%.1f' % (plot_config['state_labels'][dim], value)
-            for dim, value in enumerate(plot_config['state_slices'])
-            if dim not in [x_idx, y_idx, slice_idx]
-        ]
+        if interception_slice:
+            slice_description = ('attacker flying at the target at %.1f m/s from each position, '
+                                 'defender at rest at (px_d, 0)' % attacker_speed)
+        else:
+            slice_description = 'Fixed: ' + ', '.join(
+                '%s=%.1f' % (plot_config['state_labels'][dim], value)
+                for dim, value in enumerate(plot_config['state_slices'])
+                if dim not in [x_idx, y_idx, slice_idx])
         fig.suptitle(
-            '%s value function (black: V=0)\nFixed: %s' %
-            (type(self.dataset.dynamics).__name__, ', '.join(fixed_states)))
+            '%s value function (black: V=0)\n%s' %
+            (type(self.dataset.dynamics).__name__, slice_description))
         fig.colorbar(image, ax=axes, shrink=0.9, label='V(t, x): red ≤ 0, blue > 0')
         fig.savefig(save_path)
         if self.use_wandb:
@@ -387,7 +518,10 @@ class Experiment(ABC):
             mpc_loss_weight=1.0, mpc_loss_type='l2', mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
             lr_final=None, lr_decay_start_epoch=None, resume_lr=None,
+            mpc_holdout_games=0, mpc_holdout_eval_epochs=5000,
+            val_slice='zero_velocity', val_attacker_speed=2.0, val_defender_range=1.0,
         ):
+        self.val_slice = dict(kind=val_slice, attacker_speed=val_attacker_speed, defender_range=val_defender_range)
         was_eval = not self.model.training
         self.model.train()
         self.model.requires_grad_(True)
@@ -494,6 +628,19 @@ class Experiment(ABC):
         if additional_epochs:
             print('Refining at the full horizon through epoch %d' % target_epochs)
 
+        refresh_kwargs = dict(
+            mpc_configs=mpc_config, optimized_player='joint' if mpc_optimized_player == 'both' else mpc_optimized_player,
+            initial_guess=mpc_initial_guess, state_distribution=mpc_state_distribution,
+            defender_position_std=mpc_defender_position_std, attacker_boundary_std=mpc_attacker_boundary_std,
+            attacker_velocity=mpc_attacker_velocity, attacker_velocity_spread_deg=mpc_attacker_velocity_spread_deg,
+            attacker_speed_max=mpc_attacker_speed_max, time_distribution=mpc_time_distribution,
+            rollout=mpc_rollout, replan_every=mpc_replan_every, end_on_event=mpc_end_on_event,
+            game_solver=mpc_game_solver, use_network=mpc_use_network, crop_to_domain=mpc_crop_to_domain,
+            labels_per_refresh=mpc_labels_per_refresh)
+        mpc_holdout = None
+        if use_mpc_guidance and mpc_holdout_games > 0:
+            mpc_holdout = self._prepare_mpc_holdout(device, refresh_kwargs, mpc_holdout_games)
+
         def scheduled_lr(epoch):
             """Constant lr until lr_decay_start_epoch, then exponential decay reaching lr_final at the last epoch."""
             if lr_final is None or lr_decay_start_epoch is None or epoch < lr_decay_start_epoch:
@@ -520,15 +667,11 @@ class Experiment(ABC):
                                          else (mpc_optimized_player,))
                     for optimized_player in optimized_players:
                         self._refresh_mpc_dataset(
-                            device, mpc_config, mpc_num_initial_states,
-                            mpc_replay_buffer, optimized_player, mpc_generator,
-                            mpc_initial_guess, mpc_state_distribution,
-                            mpc_defender_position_std, mpc_attacker_boundary_std,
-                            mpc_attacker_velocity, mpc_attacker_velocity_spread_deg,
-                            mpc_attacker_speed_max, mpc_time_distribution,
-                            mpc_rollout, mpc_replan_every, mpc_end_on_event,
-                            mpc_game_solver, mpc_use_network, mpc_crop_to_domain,
-                            mpc_labels_per_refresh)
+                            device, num_initial_states=mpc_num_initial_states, replay_buffer=mpc_replay_buffer,
+                            generator=mpc_generator, **dict(refresh_kwargs, optimized_player=optimized_player))
+                if (mpc_holdout is not None and not self.dataset.pretrain and epoch > start_epoch and
+                        not epoch % mpc_holdout_eval_epochs):
+                    self._evaluate_mpc_holdout(mpc_holdout, device, epoch)
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)
@@ -558,6 +701,7 @@ class Experiment(ABC):
                         losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, reach_values, avoid_values, dirichlet_masks, model_results['model_out'])
                     else:
                         raise NotImplementedError
+                    residual_points = losses.pop('pde_residual_points', None)   # logging only
 
                     mpc_mask = gt.get('mpc_mask')
                     if use_mpc_guidance and mpc_mask is not None and bool(mpc_mask.any()):
@@ -674,6 +818,8 @@ class Experiment(ABC):
                             if 'mpc_data' in losses:
                                 wandb_metrics['mpc_data_loss'] = losses['mpc_data']
                                 wandb_metrics['mpc_loss_weight'] = mpc_loss_weight
+                            wandb_metrics.update(self._batch_diagnostics(
+                                gt, residual_points, values, model_input['model_coords']))
                             wandb.log(wandb_metrics)
 
                     total_steps += 1
@@ -881,6 +1027,8 @@ class Experiment(ABC):
                         device=device, epoch=completed_epochs, save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot_epoch_%04d.png' % completed_epochs),
                         x_resolution = val_x_resolution, y_resolution = val_y_resolution, z_resolution=val_z_resolution, time_resolution=val_time_resolution)
 
+        if mpc_holdout is not None:
+            self._evaluate_mpc_holdout(mpc_holdout, device, target_epochs)
         final_checkpoint = self._training_checkpoint(
             target_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight, mpc_replay_buffer)
         self._atomic_torch_save(final_checkpoint, resume_checkpoint_path)

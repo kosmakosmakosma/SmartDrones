@@ -125,11 +125,13 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_defender_keep_out', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Reject defender MPC plans that enter the defender exclusion zone (the breach still counts as an attacker win in labels)')
     p.add_argument('--mpc_crop_to_domain', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='Store only MPC labels whose state lies inside the training domain (labels are still computed over the full game)')
     p.add_argument('--mpc_loss_type', type=str, default='l1', choices=['l1', 'l2'], help="MPC value loss: 'l1' mean |V - label| (constant pull per label, like the PDE residual) or 'l2' mean squared error")
+    p.add_argument('--mpc_holdout_games', type=int, default=0, help='Number of fixed held-out MPC games (full tMax, never trained on) used to measure how well the network predicts game outcomes; 0 disables')
+    p.add_argument('--mpc_holdout_eval_epochs', type=int, default=5000, help='Epochs between evaluations on the held-out MPC games')
     p.add_argument('--mpc_labels_per_refresh', type=int, default=None, help='Store at most this many (randomly chosen) labels per MPC refresh')
     p.add_argument('--mpc_game_solver', type=str, default='maxmin', choices=['alternating', 'maxmin', 'mixed'], help="Joint MPC planner: 'maxmin' scores every attacker x defender plan pair and each player keeps its best worst-case plan; 'mixed' solves that table as a matrix game and samples each player's plan from its equilibrium mixture; 'alternating' best-responds to the opponent's current plan")
     p.add_argument('--mpc_use_network', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='false: joint MPC uses no network at all (zero initial plans, terminal-set margin as terminal value)')
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
-    p.add_argument('--mpc_time_distribution', type=str, default='tmax', choices=['uniform', 'tmax'], help="Time-to-go of MPC initial states: 'tmax' starts every rollout at tMax, 'uniform' follows the training curriculum")
+    p.add_argument('--mpc_time_distribution', type=str, default='tmax', choices=['uniform', 'current_max', 'tmax'], help="Time-to-go of MPC initial states: 'current_max' starts every game at the current curriculum maximum, 'uniform' anywhere below it, 'tmax' at tMax (only after the curriculum)")
     p.add_argument('--mpc_start_epoch', type=int, default=0, help='First global training epoch at which MPC replay generation is enabled')
     p.add_argument('--mpc_refresh_epochs', type=int, default=1000, help='Epochs between MPC dataset refreshes')
     p.add_argument('--mpc_replay_capacity', type=int, default=200000, help='Maximum number of MPC labels retained in the replay buffer')
@@ -142,6 +144,9 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--val_x_resolution', type=int, default=200, help='x-axis resolution of validation plot during training')
     p.add_argument('--val_y_resolution', type=int, default=200, help='y-axis resolution of validation plot during training')
     p.add_argument('--val_z_resolution', type=int, default=5, help='z-axis resolution of validation plot during training')
+    p.add_argument('--val_slice', type=str, default='zero_velocity', choices=['zero_velocity', 'interception'], help="Validation plot slice: 'interception' = attacker flying at the target at --val_attacker_speed, defender at rest near the target")
+    p.add_argument('--val_attacker_speed', type=float, default=2.0, help='Attacker speed (m/s) in the interception validation slice')
+    p.add_argument('--val_defender_range', type=float, default=1.0, help='Defender x positions in the interception validation slice span [-range, range]')
     p.add_argument('--val_time_resolution', type=int, default=3, help='time-axis resolution of validation plot during training')
 
     # loss options
@@ -326,6 +331,11 @@ if (mode == 'all') or (mode == 'train'):
                               if getattr(orig_opt, 'lr_decay_start_epoch', None) is not None
                               else (orig_opt.pretrain_iters if orig_opt.pretrain else 0) + orig_opt.counter_end),
         resume_lr=opt.resume_lr if opt.resume else None,
+        mpc_holdout_games=getattr(mpc_options, 'mpc_holdout_games', 0),
+        mpc_holdout_eval_epochs=getattr(mpc_options, 'mpc_holdout_eval_epochs', 5000),
+        val_slice=getattr(opt, 'val_slice', 'zero_velocity'),
+        val_attacker_speed=getattr(opt, 'val_attacker_speed', 2.0),
+        val_defender_range=getattr(opt, 'val_defender_range', 1.0),
         use_mpc_guidance=use_mpc_guidance, mpc_config=mpc_config, mpc_replay_buffer=mpc_replay_buffer,
         mpc_num_initial_states=getattr(mpc_options, 'mpc_num_initial_states', 256),
         mpc_start_epoch=getattr(mpc_options, 'mpc_start_epoch', 0),

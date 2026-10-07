@@ -41,13 +41,19 @@ def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
             if minWith == 'target':
                 diff_constraint_hom = torch.min(
                     torch.max(diff_constraint_hom, value - reach_value), value + avoid_value)
+        # per-point |residual| for logging only (removed from the loss dict before summing)
+        residual_points = torch.abs(diff_constraint_hom).detach() if diff_constraint_hom.dim() else None
 
         dirichlet = value[dirichlet_mask] - boundary_value[dirichlet_mask]
         if dynamics.deepreach_model == 'exact':
             if torch.all(dirichlet_mask):
                 dirichlet = output.squeeze(dim=-1)[dirichlet_mask]-0.0
             else:
-                return {'diff_constraint_hom': torch.abs(diff_constraint_hom).mean()}
-        return {'dirichlet': torch.abs(dirichlet).mean() / dirichlet_loss_divisor,
-                'diff_constraint_hom': torch.abs(diff_constraint_hom).mean()}
+                return {'diff_constraint_hom': torch.abs(diff_constraint_hom).mean(),
+                        'pde_residual_points': residual_points}
+        losses = {'dirichlet': torch.abs(dirichlet).mean() / dirichlet_loss_divisor,
+                  'diff_constraint_hom': torch.abs(diff_constraint_hom).mean()}
+        if residual_points is not None:
+            losses['pde_residual_points'] = residual_points
+        return losses
     return brat_hjivi_loss

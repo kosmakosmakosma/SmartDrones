@@ -520,6 +520,7 @@ class Experiment(ABC):
             lr_final=None, lr_decay_start_epoch=None, resume_lr=None,
             mpc_holdout_games=0, mpc_holdout_eval_epochs=5000,
             val_slice='zero_velocity', val_attacker_speed=2.0, val_defender_range=1.0,
+            value_ceiling_weight=0.0, monotonic_weight=0.0,
         ):
         self.val_slice = dict(kind=val_slice, attacker_speed=val_attacker_speed, defender_range=val_defender_range)
         was_eval = not self.model.training
@@ -703,6 +704,24 @@ class Experiment(ABC):
                         raise NotImplementedError
                     residual_points = losses.pop('pde_residual_points', None)   # logging only
 
+                    # exact one-sided rules of the game (not during pretraining, where every point is at t = 0)
+                    bound_metrics = {}
+                    summary_step = not total_steps % steps_til_summary
+                    has_ceiling = hasattr(self.dataset.dynamics, 'value_upper_bound')
+                    if not self.dataset.pretrain and has_ceiling and (value_ceiling_weight > 0 or summary_step):
+                        times = self.dataset.dynamics.input_to_coord(model_results['model_in'].detach())[..., 0]
+                        excess = torch.relu(values - self.dataset.dynamics.value_upper_bound(times, states.detach()))
+                        if value_ceiling_weight > 0:
+                            losses['value_ceiling'] = value_ceiling_weight * excess.mean()
+                        bound_metrics['bounds/ceiling_excess'] = excess.mean().item()
+                        bound_metrics['bounds/ceiling_violation_share'] = (excess > 1e-3).float().mean().item()
+                    if not self.dataset.pretrain and (monotonic_weight > 0 or summary_step):
+                        increase = torch.relu(dvs[..., 0])
+                        if monotonic_weight > 0:
+                            losses['monotonic'] = monotonic_weight * increase.mean()
+                        bound_metrics['bounds/dvdt_positive_mean'] = increase.mean().item()
+                        bound_metrics['bounds/dvdt_positive_share'] = (increase > 1e-2).float().mean().item()
+
                     mpc_mask = gt.get('mpc_mask')
                     if use_mpc_guidance and mpc_mask is not None and bool(mpc_mask.any()):
                         # MPC states are part of the batch (PDE residual above) and also carry value labels
@@ -820,6 +839,10 @@ class Experiment(ABC):
                                 wandb_metrics['mpc_loss_weight'] = mpc_loss_weight
                             wandb_metrics.update(self._batch_diagnostics(
                                 gt, residual_points, values, model_input['model_coords']))
+                            wandb_metrics.update(bound_metrics)
+                            for name in ('value_ceiling', 'monotonic'):
+                                if name in losses:
+                                    wandb_metrics['%s_loss' % name] = losses[name].item()
                             wandb.log(wandb_metrics)
 
                     total_steps += 1

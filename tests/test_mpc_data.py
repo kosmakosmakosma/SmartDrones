@@ -170,17 +170,37 @@ def test_inward_attacker_velocity_points_at_target():
     assert torch.all(torch.abs(velocity) <= 3.0)
 
 
-def test_tmax_time_distribution_requires_finished_curriculum():
+def test_tmax_time_distribution_starts_full_games_during_the_curriculum():
     from utils.mpc_data import sample_mpc_initial_times
-    dataset = SimpleNamespace(tMax=1.0, _current_t_max=lambda: 1.0)
+    dataset = SimpleNamespace(tMax=1.0, _current_t_max=lambda: 0.5)
     assert torch.equal(sample_mpc_initial_times(dataset, 3, 'tmax'), torch.ones(3))
-    dataset._current_t_max = lambda: 0.5
-    try:
-        sample_mpc_initial_times(dataset, 3, 'tmax')
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('expected ValueError before the curriculum reaches tMax')
+    assert torch.equal(sample_mpc_initial_times(dataset, 3, 'current_max'), torch.full((3,), 0.5))
+
+
+def test_value_upper_bound_straight_attacker():
+    dynamics = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2,
+                                     vel_max_a=3.6, vel_max_d=3.0, box_loses=True)
+    # attacker 1.5 m from the target flying at it at 2 m/s, defender far away
+    state = torch.tensor([[1.5, -2.0, 0.0, 0.0, -1.5, 0.0, 1.5, 0.0]])
+    times = torch.tensor([0.0, 0.1, 0.4, 2.0])
+    bound = dynamics.value_upper_bound(times, state.expand(4, -1))
+    assert bound[0] == pytest.approx(1.3, abs=1e-5)                     # no time: attacker margin
+    # 0.1 s: at least 0.2 m covered (starts at 2 m/s and only speeds up)
+    assert 0.2 + 1e-3 < bound[1] <= 1.1 + 1e-5
+    assert bound[3] == pytest.approx(0.2, abs=1e-5)                     # reaches the centre: capture bound
+    assert torch.all(bound[1:] <= bound[:-1] + 1e-6)                    # more time never raises it
+
+    # never below the t = 0 rules for random in-box states, and non-increasing in t
+    torch.manual_seed(0)
+    states = dynamics.sample_model_states(500) * dynamics.state_var
+    zero = dynamics.value_upper_bound(torch.zeros(500), states)
+    assert torch.all(zero >= dynamics.boundary_fn(states) - 1e-5)
+    later = dynamics.value_upper_bound(torch.full((500,), 1.0), states)
+    assert torch.all(later <= zero + 1e-6)
+
+    # an attacker heading out of the box at top speed may leave it: the bound accounts for it
+    edge = torch.tensor([[1.95, 3.6, 0.0, 0.0, -1.5, 0.0, 1.5, 0.0]])
+    assert dynamics.value_upper_bound(torch.tensor([2.0]), edge)[0] > 0.2
 
 
 def test_closed_loop_refresh_passes_options_and_labels_executed_trajectory(monkeypatch, tmp_path):

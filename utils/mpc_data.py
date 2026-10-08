@@ -144,16 +144,15 @@ def sample_mpc_initial_states(
 
 
 def sample_mpc_initial_times(dataset, num_samples, distribution='uniform'):
-    """Time-to-go for MPC initial states: 'uniform' follows the training curriculum, 'tmax' starts every rollout at tMax."""
+    """Time-to-go for MPC initial states: 'uniform' follows the training curriculum, 'current_max' starts every
+    game at the current curriculum maximum, 'tmax' starts every game at tMax."""
     if distribution == 'uniform':
         return dataset._sample_times(num_samples).squeeze(-1)
     if distribution == 'current_max':   # every game starts at the current curriculum maximum
         return torch.full((num_samples,), float(dataset._current_t_max()))
     if distribution == 'tmax':
-        if dataset._current_t_max() < dataset.tMax:
-            raise ValueError(
-                'mpc_time_distribution=tmax requires the time curriculum to have reached tMax '
-                '(set mpc_start_epoch after pretraining and counter_end)')
+        # full-length games from the start: labels with more time-to-event than the current curriculum
+        # maximum wait in the replay buffer until the curriculum reaches them (sample_up_to_time)
         return torch.full((num_samples,), float(dataset.tMax))
     raise ValueError("distribution must be 'uniform', 'current_max' or 'tmax'")
 

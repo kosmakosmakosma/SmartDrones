@@ -254,6 +254,47 @@ class CrazyflieInterception(Dynamics):
         """BRAT terminal condition: max(l_R, -l_A)."""
         return torch.max(self.reach_fn(state), -self.avoid_fn(state))
 
+    @torch.no_grad()
+    def value_upper_bound(self, times, states, dt=0.02):
+        """Upper bound on V(t, x) from one fixed attacker plan: fly straight at the target, ignore the defender.
+
+        V(t, x) = min over tau <= t of max(reach(x_tau), max_{s <= tau} fail(x_s)). Along any attacker
+        trajectory, whatever the defender does: reach <= attacker target margin, and fail <= capture_R
+        (plus, with box_loses, how far the attacker is outside the box). Evaluating that at the grid
+        times k*dt <= t gives a valid bound; the plan is exactly feasible (piecewise-constant
+        acceleration within the per-axis limit, speed never above vel_max_a) and the box term includes
+        the largest overshoot of a position parabola between grid points (accel * dt^2 / 8).
+        """
+        times = times.reshape(-1)
+        position = states[..., [0, 2]].reshape(-1, 2).clone()
+        velocity = states[..., [1, 3]].reshape(-1, 2).clone()
+        speed_limit = float('inf') if self.vel_max_a is None else float(self.vel_max_a)
+        between_steps = self.accel_max_a * dt ** 2 / 8
+
+        def attacker_outside_box(position, slack=0.0):
+            if not self.box_loses:
+                return torch.full_like(position[:, 0], -float('inf'))
+            return torch.amax(torch.abs(position), dim=-1) + slack - self.pos_range
+
+        worst_fail = torch.clamp(attacker_outside_box(position), min=self.capture_R)
+        bound = torch.maximum(torch.linalg.vector_norm(position, dim=-1) - self.target_R, worst_fail)
+        for step in range(1, int(math.ceil(float(times.max()) / dt - 1e-6)) + 1):
+            # desired velocity: top speed (or a large one) straight at the target centre
+            distance = torch.linalg.vector_norm(position, dim=-1, keepdim=True)
+            desired = -position / distance.clamp_min(1e-9) * min(speed_limit, 1e3)
+            # move the velocity toward the desired one, scaled uniformly so no axis exceeds accel_max_a;
+            # the new velocity lies between two velocities inside the speed disk, so it is inside too
+            change = desired - velocity
+            scale = torch.clamp(self.accel_max_a * dt / torch.amax(torch.abs(change), dim=-1, keepdim=True).clamp_min(1e-12), max=1.0)
+            acceleration = change * scale / dt
+            position = position + velocity * dt + 0.5 * acceleration * dt ** 2
+            velocity = velocity + acceleration * dt
+            worst_fail = torch.maximum(worst_fail, attacker_outside_box(position, between_steps))
+            candidate = torch.maximum(torch.linalg.vector_norm(position, dim=-1) - self.target_R, worst_fail)
+            active = step * dt <= times + 1e-9
+            bound = torch.where(active, torch.minimum(bound, candidate), bound)
+        return bound.reshape(states.shape[:-1])
+
     SPEED_LIMIT_TOLERANCE = 0.01   # m/s: within this of the limit a drone counts as being at it
 
     def _best_acceleration(self, state, gradient, velocity_indices, accel_max, vel_max, minimize):

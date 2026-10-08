@@ -150,6 +150,8 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--val_time_resolution', type=int, default=3, help='time-axis resolution of validation plot during training')
 
     # loss options
+    p.add_argument('--value_ceiling_weight', type=float, default=0.0, help='Weight of the penalty max(0, V - U), U = exact upper bound from an attacker flying straight at the target (CrazyflieInterception only; 0 = off)')
+    p.add_argument('--monotonic_weight', type=float, default=0.0, help='Weight of the penalty max(0, dV/dt): more time can only help the attacker, so V must not increase with t (0 = off)')
     p.add_argument('--minWith', type=str, required=True, choices=['none', 'zero', 'target'], help='BRS vs BRT computation (typically should be using target for BRT)')
 
     # load dynamics_class choices dynamically from dynamics module
@@ -336,6 +338,8 @@ if (mode == 'all') or (mode == 'train'):
         val_slice=getattr(opt, 'val_slice', 'zero_velocity'),
         val_attacker_speed=getattr(opt, 'val_attacker_speed', 2.0),
         val_defender_range=getattr(opt, 'val_defender_range', 1.0),
+        value_ceiling_weight=getattr(opt, 'value_ceiling_weight', 0.0),
+        monotonic_weight=getattr(opt, 'monotonic_weight', 0.0),
         use_mpc_guidance=use_mpc_guidance, mpc_config=mpc_config, mpc_replay_buffer=mpc_replay_buffer,
         mpc_num_initial_states=getattr(mpc_options, 'mpc_num_initial_states', 256),
         mpc_start_epoch=getattr(mpc_options, 'mpc_start_epoch', 0),

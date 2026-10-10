@@ -715,6 +715,15 @@ class Experiment(ABC):
                             losses['value_ceiling'] = value_ceiling_weight * excess.mean()
                         bound_metrics['bounds/ceiling_excess'] = excess.mean().item()
                         bound_metrics['bounds/ceiling_violation_share'] = (excess > 1e-3).float().mean().item()
+                        # the same per point group (random / capture / mpc ...) to locate the violations
+                        groups = gt.get('point_group')
+                        if groups is not None:
+                            for index, name in enumerate(POINT_GROUPS):
+                                mask = groups == index
+                                if mask.any():
+                                    bound_metrics['bounds/ceiling_violation_share_%s' % name] = (
+                                        excess[mask] > 1e-3).float().mean().item()
+                                    bound_metrics['bounds/ceiling_excess_%s' % name] = excess[mask].mean().item()
                     if not self.dataset.pretrain and (monotonic_weight > 0 or summary_step):
                         increase = torch.relu(dvs[..., 0])
                         if monotonic_weight > 0:

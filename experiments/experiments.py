@@ -118,7 +118,7 @@ class Experiment(ABC):
             attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
             time_distribution='uniform', rollout='open_loop', replan_every=1,
             end_on_event=False, game_solver='alternating', use_network=True, crop_to_domain=False,
-            labels_per_refresh=None, fixed_start_time=None, log_new_games=True):
+            labels_per_refresh=None, fixed_start_time=None, log_new_games=True, cap_labels=False):
         """Play MPC games, label their states and add them to `replay_buffer` (if given).
 
         Before the labels are added, the network's predictions on the new games are compared with their
@@ -248,6 +248,17 @@ class Experiment(ABC):
             'start_states': result.states[:, 0].detach().cpu(),
             'start_values': result.suffix_values[:, 0].detach().cpu(),
         }
+        cap_metrics = {}
+        if cap_labels and hasattr(self.dataset.dynamics, 'value_upper_bound'):
+            # a label above the exact straight-flight ceiling (network game, box rule included) is wrong
+            # by proof: lower it to the ceiling
+            for prefix in ('', 'start_'):
+                ceiling = self.dataset.dynamics.value_upper_bound(games[prefix + 'times'], games[prefix + 'states'])
+                excess = (games[prefix + 'values'] - ceiling).clamp(min=0)
+                games[prefix + 'values'] = torch.minimum(games[prefix + 'values'], ceiling)
+                if prefix == '' and excess.numel():
+                    cap_metrics = {'mpc_labels_capped_share': (excess > 1e-3).float().mean().item(),
+                                   'mpc_labels_capped_mean_excess': excess.mean().item()}
 
         new_game_metrics = {}
         if log_new_games:   # the network has not seen these games yet
@@ -269,7 +280,7 @@ class Experiment(ABC):
                 wandb.log({
                     'mpc_replay_buffer_size': len(replay_buffer),
                     'mpc_%s_mean_score' % optimized_player: result.score.mean().item(),
-                    **new_game_metrics,
+                    **new_game_metrics, **cap_metrics,
                 })
 
         for parameter, required_grad in zip(self.model.parameters(), requires_grad_flags):
@@ -518,7 +529,7 @@ class Experiment(ABC):
             mpc_loss_weight=1.0, mpc_loss_type='l2', mpc_seed=None, mpc_initial_guess='network',
             mpc_optimized_player='attacker',
             lr_final=None, lr_decay_start_epoch=None, resume_lr=None,
-            mpc_holdout_games=0, mpc_holdout_eval_epochs=5000,
+            mpc_holdout_games=0, mpc_holdout_eval_epochs=5000, mpc_cap_labels=False,
             val_slice='zero_velocity', val_attacker_speed=2.0, val_defender_range=1.0,
             value_ceiling_weight=0.0, monotonic_weight=0.0,
         ):
@@ -637,7 +648,7 @@ class Experiment(ABC):
             attacker_speed_max=mpc_attacker_speed_max, time_distribution=mpc_time_distribution,
             rollout=mpc_rollout, replan_every=mpc_replan_every, end_on_event=mpc_end_on_event,
             game_solver=mpc_game_solver, use_network=mpc_use_network, crop_to_domain=mpc_crop_to_domain,
-            labels_per_refresh=mpc_labels_per_refresh)
+            labels_per_refresh=mpc_labels_per_refresh, cap_labels=mpc_cap_labels)
         mpc_holdout = None
         if use_mpc_guidance and mpc_holdout_games > 0:
             mpc_holdout = self._prepare_mpc_holdout(device, refresh_kwargs, mpc_holdout_games)

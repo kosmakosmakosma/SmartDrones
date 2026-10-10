@@ -135,6 +135,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_start_epoch', type=int, default=0, help='First global training epoch at which MPC replay generation is enabled')
     p.add_argument('--mpc_refresh_epochs', type=int, default=1000, help='Epochs between MPC dataset refreshes')
     p.add_argument('--mpc_replay_capacity', type=int, default=200000, help='Maximum number of MPC labels retained in the replay buffer')
+    p.add_argument('--mpc_cap_labels', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=False, help='Lower MPC labels (training and held-out) that lie above the exact straight-flight value ceiling to the ceiling')
     p.add_argument('--mpc_reset_replay', default=False, action='store_true', help='Discard saved MPC labels when resuming while preserving the network and curriculum state')
     p.add_argument('--mpc_batch_size', type=int, default=1000, help='Batch size sampled from the MPC replay buffer each training step')
     p.add_argument('--mpc_loss_weight', type=float, default=1.0, help='Weight of the MPC data loss relative to the BRAT PDE loss')
@@ -348,6 +349,7 @@ if (mode == 'all') or (mode == 'train'):
         mpc_defender_position_std=getattr(mpc_options, 'mpc_defender_position_std', 0.5),
         mpc_attacker_boundary_std=getattr(mpc_options, 'mpc_attacker_boundary_std', 0.2),
         mpc_reset_replay=getattr(mpc_options, 'mpc_reset_replay', False),
+        mpc_cap_labels=getattr(mpc_options, 'mpc_cap_labels', False),
         mpc_attacker_velocity=getattr(mpc_options, 'mpc_attacker_velocity', 'uniform'),
         mpc_attacker_velocity_spread_deg=getattr(mpc_options, 'mpc_attacker_velocity_spread_deg', 60.0),
         mpc_attacker_speed_max=getattr(mpc_options, 'mpc_attacker_speed_max', None),

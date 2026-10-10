@@ -264,6 +264,33 @@ def test_crop_to_domain_stores_only_in_domain_labels(monkeypatch, tmp_path):
     assert torch.equal(replay.values, torch.tensor([0.3, 0.2, 0.3, 0.2]))   # labels from the full game
 
 
+def test_cap_labels_lowers_labels_above_the_value_ceiling(monkeypatch, tmp_path):
+    dynamics = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.6, vel_max_d=3.0)
+
+    class DatasetStub:
+        def __init__(self):
+            self.dynamics = dynamics
+
+        def _sample_times(self, count):
+            return torch.ones(count, 1)
+
+    def fake_closed_loop(states, times, nominal_u, nominal_d, responder, dyn, *args, **kwargs):
+        path = states[:, None].expand(states.shape[0], 3, 8).clone()
+        return SimpleNamespace(states=path, suffix_values=torch.full((states.shape[0], 3), 5.0),
+                               score=torch.full((states.shape[0],), 5.0), event_steps=None)
+
+    monkeypatch.setattr(experiments, 'closed_loop_rollout', fake_closed_loop)
+    experiment = experiments.DeepReach(torch.nn.Linear(9, 1), DatasetStub(), str(tmp_path), use_wandb=False)
+    replay = MPCReplayBuffer(state_dim=8, capacity=100)
+    config = SimpleNamespace(horizon_steps=2, dt=0.25)
+    games = experiment._refresh_mpc_dataset(
+        'cpu', {'attacker': config, 'defender': config}, 2, replay, 'joint', state_distribution='interception',
+        rollout='closed_loop', use_network=False, initial_guess='zero', log_new_games=False, cap_labels=True)
+    ceiling = dynamics.value_upper_bound(replay.times, replay.states)
+    assert torch.allclose(replay.values, ceiling)                 # every label (5.0) was above its ceiling
+    assert torch.all(games['start_values'] < 5.0)
+
+
 def test_speed_limited_hamiltonian_matches_brute_force():
     torch.manual_seed(0)
     dyn = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.6, vel_max_d=3.0)

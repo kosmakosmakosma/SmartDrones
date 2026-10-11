@@ -118,7 +118,8 @@ class Experiment(ABC):
             attacker_velocity_spread_deg=60.0, attacker_speed_max=None,
             time_distribution='uniform', rollout='open_loop', replan_every=1,
             end_on_event=False, game_solver='alternating', use_network=True, crop_to_domain=False,
-            labels_per_refresh=None, fixed_start_time=None, log_new_games=True, cap_labels=False):
+            labels_per_refresh=None, fixed_start_time=None, log_new_games=True, cap_labels=False,
+            defender_ring_width=1.0, drop_after_event=False):
         """Play MPC games, label their states and add them to `replay_buffer` (if given).
 
         Before the labels are added, the network's predictions on the new games are compared with their
@@ -149,7 +150,8 @@ class Experiment(ABC):
         real_states = sample_mpc_initial_states(
             dynamics, num_initial_states, state_distribution,
             defender_position_std, attacker_boundary_std, attacker_velocity,
-            attacker_velocity_spread_deg, attacker_speed_max).to(device)
+            attacker_velocity_spread_deg, attacker_speed_max,
+            defender_ring_width=defender_ring_width).to(device)
 
         if initial_guess not in ('network', 'zero'):
             raise ValueError("initial_guess must be 'network' or 'zero'")
@@ -231,6 +233,13 @@ class Experiment(ABC):
         event_steps = getattr(result, 'event_steps', None)
         if event_steps is not None:   # states after the game ended are frozen duplicates: drop them
             keep = torch.arange(horizon_plus_one, device=label_times.device)[None] <= event_steps[:, None]
+        elif drop_after_event:
+            # the game was played to the end (labels include what happens after the first capture / target
+            # hit / breach), but only the states before that first event are stored
+            decided = (dynamics.reach_fn(result.states) <= 0) | (dynamics.avoid_fn(result.states) <= 0)
+            first_event = torch.where(decided.any(dim=1), decided.float().argmax(dim=1),
+                                      torch.full_like(decided[:, 0], horizon_plus_one, dtype=torch.long))
+            keep = torch.arange(horizon_plus_one, device=label_times.device)[None] < first_event[:, None]
         if crop_to_domain:   # labels were computed over the full game; only in-domain states are stored
             keep = keep & in_domain_mask(dynamics, result.states)
         # states after the time-to-go ran out are frozen copies of the last one: keep only the first
@@ -530,6 +539,7 @@ class Experiment(ABC):
             mpc_optimized_player='attacker',
             lr_final=None, lr_decay_start_epoch=None, resume_lr=None,
             mpc_holdout_games=0, mpc_holdout_eval_epochs=5000, mpc_cap_labels=False,
+            mpc_defender_ring_width=1.0, mpc_drop_after_event=False,
             val_slice='zero_velocity', val_attacker_speed=2.0, val_defender_range=1.0,
             value_ceiling_weight=0.0, monotonic_weight=0.0,
         ):
@@ -648,7 +658,8 @@ class Experiment(ABC):
             attacker_speed_max=mpc_attacker_speed_max, time_distribution=mpc_time_distribution,
             rollout=mpc_rollout, replan_every=mpc_replan_every, end_on_event=mpc_end_on_event,
             game_solver=mpc_game_solver, use_network=mpc_use_network, crop_to_domain=mpc_crop_to_domain,
-            labels_per_refresh=mpc_labels_per_refresh, cap_labels=mpc_cap_labels)
+            labels_per_refresh=mpc_labels_per_refresh, cap_labels=mpc_cap_labels,
+            defender_ring_width=mpc_defender_ring_width, drop_after_event=mpc_drop_after_event)
         mpc_holdout = None
         if use_mpc_guidance and mpc_holdout_games > 0:
             mpc_holdout = self._prepare_mpc_holdout(device, refresh_kwargs, mpc_holdout_games)

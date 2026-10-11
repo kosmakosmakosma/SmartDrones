@@ -113,7 +113,9 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_integrator', type=str, default='euler', choices=['euler', 'rk4'], help='Integration scheme used by the MPC rollout')
     p.add_argument('--mpc_candidate_chunk_size', type=int, default=None, help='Process MPC candidates in chunks of this size to limit memory use')
     p.add_argument('--mpc_num_initial_states', type=int, default=256, help='Number of initial states sampled per MPC dataset refresh')
-    p.add_argument('--mpc_state_distribution', type=str, default='interception', choices=['uniform', 'interception'], help='Initial-state distribution used for MPC label generation')
+    p.add_argument('--mpc_state_distribution', type=str, default='interception', choices=['uniform', 'interception', 'engagement'], help="Initial-state distribution used for MPC label generation; 'engagement': attacker anywhere in the box, defender in a ring around its exclusion zone, both velocities in their speed disks, already-decided states redrawn")
+    p.add_argument('--mpc_defender_ring_width', type=float, default=1.0, help="'engagement' starts: the defender is placed between its exclusion radius and exclusion radius + this width (m)")
+    p.add_argument('--mpc_drop_after_event', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=False, help='With --mpc_end_on_event false: play the full game but store only the states before its first capture / target hit / breach')
     p.add_argument('--mpc_defender_position_std', type=float, default=0.5, help='Defender position standard deviation around the origin in metres')
     p.add_argument('--mpc_attacker_boundary_std', type=float, default=0.2, help='Attacker inward distance standard deviation from a position-domain boundary in metres')
     p.add_argument('--mpc_attacker_velocity', type=str, default='inward', choices=['uniform', 'inward'], help="Attacker initial velocity for interception sampling: 'inward' points at the target, 'uniform' samples each component independently")
@@ -350,6 +352,8 @@ if (mode == 'all') or (mode == 'train'):
         mpc_attacker_boundary_std=getattr(mpc_options, 'mpc_attacker_boundary_std', 0.2),
         mpc_reset_replay=getattr(mpc_options, 'mpc_reset_replay', False),
         mpc_cap_labels=getattr(mpc_options, 'mpc_cap_labels', False),
+        mpc_defender_ring_width=getattr(mpc_options, 'mpc_defender_ring_width', 1.0),
+        mpc_drop_after_event=getattr(mpc_options, 'mpc_drop_after_event', False),
         mpc_attacker_velocity=getattr(mpc_options, 'mpc_attacker_velocity', 'uniform'),
         mpc_attacker_velocity_spread_deg=getattr(mpc_options, 'mpc_attacker_velocity_spread_deg', 60.0),
         mpc_attacker_speed_max=getattr(mpc_options, 'mpc_attacker_speed_max', None),

@@ -66,8 +66,13 @@ def sample_mpc_initial_states(
         dynamics, num_samples, distribution='uniform',
         defender_position_std=0.5, attacker_boundary_std=0.2,
         attacker_velocity='uniform', attacker_velocity_spread_deg=60.0,
-        attacker_speed_max=None):
+        attacker_speed_max=None, defender_ring_width=1.0):
     """Real-unit initial states for MPC label generation.
+
+    'engagement': attacker position uniform in the box, defender uniform (by area) in the ring between its
+    exclusion radius and exclusion radius + defender_ring_width, both velocities uniform in their speed disks;
+    states that are already decided (attacker in the target, capture, defender in its keep-out zone) are
+    redrawn.
 
     attacker_velocity='inward' points the attacker velocity at the target (origin)
     rotated by a uniform angle in +-attacker_velocity_spread_deg, with a uniform speed
@@ -78,8 +83,10 @@ def sample_mpc_initial_states(
         return dynamics.input_to_coord(
             torch.cat((torch.zeros(num_samples, 1), model_states), dim=1)
         )[:, 1:]
+    if distribution == 'engagement':
+        return _sample_engagement_states(dynamics, num_samples, defender_ring_width)
     if distribution != 'interception':
-        raise ValueError("distribution must be 'uniform' or 'interception'")
+        raise ValueError("distribution must be 'uniform', 'interception' or 'engagement'")
     if dynamics.state_dim != 8 or not all(
             hasattr(dynamics, name) for name in ('target_R', 'capture_R')):
         raise ValueError("interception sampling requires the 8D interception dynamics")
@@ -155,6 +162,28 @@ def sample_mpc_initial_times(dataset, num_samples, distribution='uniform'):
         # maximum wait in the replay buffer until the curriculum reaches them (sample_up_to_time)
         return torch.full((num_samples,), float(dataset.tMax))
     raise ValueError("distribution must be 'uniform', 'current_max' or 'tmax'")
+
+
+def _sample_engagement_states(dynamics, num_samples, defender_ring_width):
+    if not hasattr(dynamics, 'sample_model_states') or not hasattr(dynamics, 'defender_exclusion_R'):
+        raise ValueError("engagement sampling requires the 8D interception dynamics")
+    if defender_ring_width <= 0:
+        raise ValueError('defender_ring_width must be positive')
+    inner = float(dynamics.defender_exclusion_R)
+    outer = inner + float(defender_ring_width)
+    accepted, count = [], 0
+    while count < num_samples:
+        draw = max(2 * (num_samples - count), 16)
+        model_states = dynamics.sample_model_states(draw)    # positions uniform, velocities in speed disks
+        states = dynamics.input_to_coord(torch.cat((torch.zeros(draw, 1), model_states), dim=1))[:, 1:]
+        radius = torch.sqrt(torch.empty(draw).uniform_(inner ** 2, outer ** 2))   # uniform by area
+        angle = 2 * math.pi * torch.rand(draw)
+        states[:, 4] = radius * torch.cos(angle)
+        states[:, 6] = radius * torch.sin(angle)
+        undecided = (dynamics.reach_fn(states) > 0) & (dynamics.avoid_fn(states) > 0)
+        accepted.append(states[undecided])
+        count += int(undecided.sum())
+    return torch.cat(accepted, dim=0)[:num_samples]
 
 
 def mpc_domain_constraint(dynamics, player, mode='position', defender_keep_out=True):

@@ -291,6 +291,50 @@ def test_cap_labels_lowers_labels_above_the_value_ceiling(monkeypatch, tmp_path)
     assert torch.all(games['start_values'] < 5.0)
 
 
+def test_engagement_starts_ring_disks_and_undecided():
+    from utils.mpc_data import sample_mpc_initial_states
+    dynamics = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.6, vel_max_d=3.0,
+                                     box_loses=True)
+    torch.manual_seed(0)
+    states = sample_mpc_initial_states(dynamics, 2000, 'engagement', defender_ring_width=1.0)
+    assert states.shape == (2000, 8)
+    defender_radius = torch.linalg.vector_norm(states[:, [4, 6]], dim=-1)
+    assert torch.all(defender_radius >= 0.2 - 1e-5) and torch.all(defender_radius <= 1.2 + 1e-5)
+    assert torch.all(torch.abs(states[:, [0, 2]]) <= 2.0 + 1e-5)                      # attacker anywhere in the box
+    assert torch.all(torch.linalg.vector_norm(states[:, [1, 3]], dim=-1) <= 3.6 + 1e-4)
+    assert torch.all(torch.linalg.vector_norm(states[:, [5, 7]], dim=-1) <= 3.0 + 1e-4)
+    assert torch.all(dynamics.reach_fn(states) > 0) and torch.all(dynamics.avoid_fn(states) > 0)
+    assert torch.abs(states[:, [0, 2]]).mean() > 0.8                                  # not only at the edges
+
+
+def test_drop_after_event_keeps_only_states_before_the_first_event(monkeypatch, tmp_path):
+    dynamics = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.6, vel_max_d=3.0)
+
+    class DatasetStub:
+        def __init__(self):
+            self.dynamics = dynamics
+
+        def _sample_times(self, count):
+            return torch.ones(count, 1)
+
+    def fake_closed_loop(states, times, nominal_u, nominal_d, responder, dyn, *args, **kwargs):
+        path = torch.zeros(states.shape[0], 4, 8)
+        path[:, :, 0] = torch.tensor([1.5, 1.0, 0.1, 1.0])       # attacker hits the target at step 2, then leaves
+        path[:, :, 4] = -1.5
+        return SimpleNamespace(states=path, suffix_values=torch.tensor([[-0.1, -0.1, -0.1, 0.8]]).expand(states.shape[0], 4),
+                               score=torch.full((states.shape[0],), -0.1), event_steps=None)
+
+    monkeypatch.setattr(experiments, 'closed_loop_rollout', fake_closed_loop)
+    experiment = experiments.DeepReach(torch.nn.Linear(9, 1), DatasetStub(), str(tmp_path), use_wandb=False)
+    replay = MPCReplayBuffer(state_dim=8, capacity=100)
+    config = SimpleNamespace(horizon_steps=3, dt=0.25)
+    experiment._refresh_mpc_dataset('cpu', {'attacker': config, 'defender': config}, 2, replay, 'joint',
+                                    state_distribution='interception', rollout='closed_loop', use_network=False,
+                                    initial_guess='zero', log_new_games=False, drop_after_event=True)
+    assert len(replay) == 4                                            # 2 games x steps 0 and 1
+    assert torch.allclose(replay.times, torch.tensor([1.0, 0.75, 1.0, 0.75]))   # real time left
+
+
 def test_speed_limited_hamiltonian_matches_brute_force():
     torch.manual_seed(0)
     dyn = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.6, vel_max_d=3.0)

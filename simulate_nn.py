@@ -43,6 +43,9 @@ parser.add_argument('--checkpoint', type=int, default=-1,
 parser.add_argument('--device', type=str, default='cuda:0')
 parser.add_argument('--dt', type=float, default=0.02, help='simulation timestep (s)')
 parser.add_argument('--t_max_sim', type=float, default=1.0, help='max simulation time (s)')
+parser.add_argument('--fixed_time_to_go', type=float, default=None,
+                    help='Query the network always at this time-to-go (e.g. 2.0 = tMax, the "unlimited time" value), '
+                         'also inside the MPC rollouts; default: count down from tMax')
 parser.add_argument(
     '--controller', type=str, default='bang_bang',
     choices=['bang_bang', 'mpc', 'attacker_mpc', 'defender_mpc', 'both_mpc'],
@@ -136,6 +139,23 @@ print(f"  accel_max_a = {accel_max_a}, accel_max_d = {accel_max_d}")
 device = torch.device(args.device)
 dt = args.dt
 responder = NeuralBangBangController(model=model, dynamics=dynamics, device=device)
+
+
+class FixedTimeResponder:
+    """The network controller queried at one fixed time-to-go, whatever time it is asked about."""
+
+    def __init__(self, inner, time_to_go):
+        self.inner, self.time_to_go = inner, time_to_go
+
+    def query(self, states, times):
+        return self.inner.query(states, torch.full_like(times, self.time_to_go))
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+if args.fixed_time_to_go is not None:
+    responder = FixedTimeResponder(responder, args.fixed_time_to_go)
 
 attacker_uses_mpc = args.controller in ('mpc', 'attacker_mpc', 'both_mpc')
 defender_uses_mpc = args.controller in ('defender_mpc', 'both_mpc')
@@ -277,13 +297,14 @@ outcome = "timeout"
 outcome_time = args.t_max_sim
 
 print(f"\nSimulating with dt={dt}, t_max={args.t_max_sim}, controller={args.controller}")
-print(f"Querying V with countdown tau=max({tMax} - t, 0)")
+print(f"Querying V at fixed time-to-go {args.fixed_time_to_go}" if args.fixed_time_to_go is not None
+      else f"Querying V with countdown tau=max({tMax} - t, 0)")
 print(f"Initial V = {V0:.4f}")
 print()
 
 for i in range(n_steps):
     s = trajectory[i]
-    tau = max(tMax - times[i], 0.0)
+    tau = (args.fixed_time_to_go if args.fixed_time_to_go is not None else max(tMax - times[i], 0.0))
 
     # get attacker/defender controls (bang-bang or receding-horizon MPC)
     u, d, V_val = query_controls(s, tau)
@@ -300,7 +321,7 @@ for i in range(n_steps):
     times[i + 1] = times[i] + dt
 
     # Querying the value must not trigger a second MPC optimization.
-    tau_new = max(tMax - times[i + 1], 0.0)
+    tau_new = (args.fixed_time_to_go if args.fixed_time_to_go is not None else max(tMax - times[i + 1], 0.0))
     V_new = query_value(trajectory[i + 1], tau_new)
     values[i + 1] = V_new
 

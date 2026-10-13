@@ -67,6 +67,9 @@ parser.add_argument('--mpc_defender_noise_std', type=float, default=None,
 parser.add_argument('--mpc_integrator', type=str, default='euler', choices=['euler', 'rk4'])
 parser.add_argument('--mpc_seed', type=int, default=None)
 parser.add_argument('--mpc_candidate_chunk_size', type=int, default=None)
+parser.add_argument('--mpc_replan_every', type=int, default=1,
+                    help='MPC player(s) re-optimise every N simulation steps and follow their plan in between; '
+                         'the network player always acts on the actual state')
 args = parser.parse_args()
 
 experiment_dir = os.path.join(args.experiments_dir, args.experiment_name)
@@ -210,11 +213,24 @@ def query_value(state_np, tau):
     return query.values[0].detach().cpu().item()
 
 
-def query_controls(state_np, tau):
+def query_controls(state_np, tau, step=0):
     """Attacker + defender controls and value at (state, time-to-go tau); real units, numpy in/out."""
     global nominal_attacker_controls, nominal_defender_controls
     state_tensor = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
     time_tensor = torch.tensor([tau], dtype=torch.float32, device=device)
+
+    have_plans = ((not attacker_uses_mpc or nominal_attacker_controls is not None)
+                  and (not defender_uses_mpc or nominal_defender_controls is not None))
+    if args.controller != 'bang_bang' and have_plans and step % max(args.mpc_replan_every, 1) != 0:
+        # between re-plans: MPC player(s) follow the current plan, the network player reacts to the actual state
+        query = responder.query(state_tensor, time_tensor)
+        u = (nominal_attacker_controls[0, 0] if attacker_uses_mpc else query.controls[0]).detach().cpu().numpy()
+        d = (nominal_defender_controls[0, 0] if defender_uses_mpc else query.disturbances[0]).detach().cpu().numpy()
+        if attacker_uses_mpc:
+            nominal_attacker_controls = shift_control_sequence(nominal_attacker_controls)
+        if defender_uses_mpc:
+            nominal_defender_controls = shift_control_sequence(nominal_defender_controls)
+        return u, d, query.values[0].detach().cpu().item()
 
     if args.controller == 'bang_bang':
         query = responder.query(state_tensor, time_tensor)
@@ -307,7 +323,7 @@ for i in range(n_steps):
     tau = (args.fixed_time_to_go if args.fixed_time_to_go is not None else max(tMax - times[i], 0.0))
 
     # get attacker/defender controls (bang-bang or receding-horizon MPC)
-    u, d, V_val = query_controls(s, tau)
+    u, d, V_val = query_controls(s, tau, step=i)
 
     controls_a[i] = u
     controls_d[i] = d

@@ -110,7 +110,7 @@ if args.checkpoint == -1:
     print(f"Loaded model_final.pth")
 else:
     ckpt_path = os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % args.checkpoint)
-    ckpt = torch.load(ckpt_path, map_location=args.device)
+    ckpt = torch.load(ckpt_path, map_location=args.device, weights_only=False)   # own training checkpoint (contains optimizer state)
     model.load_state_dict(ckpt['model'])
     print(f"Loaded model_epoch_{args.checkpoint:04d}.pth")
 

@@ -67,6 +67,11 @@ parser.add_argument('--mpc_defender_noise_std', type=float, default=None,
 parser.add_argument('--mpc_integrator', type=str, default='euler', choices=['euler', 'rk4'])
 parser.add_argument('--mpc_seed', type=int, default=None)
 parser.add_argument('--mpc_candidate_chunk_size', type=int, default=None)
+parser.add_argument('--defender_policy', type=str, default='gradient', choices=['gradient', 'lookahead'],
+                    help="network defender: 'gradient' = bang-bang from dV/d(defender velocity); 'lookahead' = try 9 "
+                         "accelerations, predict --lookahead_time ahead (attacker keeps its velocity) and pick the one "
+                         "with the highest V. Also used for the defender inside the attacker's MPC rollouts")
+parser.add_argument('--lookahead_time', type=float, default=0.2, help='prediction time of the lookahead defender (s)')
 parser.add_argument('--mpc_replan_every', type=int, default=1,
                     help='MPC player(s) re-optimise every N simulation steps and follow their plan in between; '
                          'the network player always acts on the actual state')
@@ -159,6 +164,51 @@ class FixedTimeResponder:
 
 if args.fixed_time_to_go is not None:
     responder = FixedTimeResponder(responder, args.fixed_time_to_go)
+
+
+class LookaheadDefenderResponder:
+    """Network controller whose defender picks, among 9 accelerations (4 box corners, 4 axis directions, none),
+    the one whose predicted state after `lookahead_time` has the highest V. The attacker keeps its current
+    velocity during the prediction. Values only (no gradients), so V's position dependence is used directly."""
+
+    def __init__(self, inner, lookahead_time, step_dt):
+        self.inner = inner
+        self.steps = max(int(round(lookahead_time / step_dt)), 1)
+        self.step_dt = lookahead_time / self.steps
+        a = dynamics.accel_max_d
+        self.candidates = torch.tensor([[a, a], [a, -a], [-a, a], [-a, -a], [a, 0.0], [-a, 0.0], [0.0, a],
+                                        [0.0, -a], [0.0, 0.0]], dtype=torch.float32, device=device)
+
+    def _values(self, states, times):
+        coords = dynamics.coord_to_input(torch.cat((times.unsqueeze(-1), states), dim=-1))
+        with torch.no_grad():
+            results = model({'coords': coords})
+            return dynamics.io_to_value(results['model_in'], results['model_out'].squeeze(-1))
+
+    def query(self, states, times):
+        query = self.inner.query(states, times)
+        states = torch.as_tensor(states, dtype=torch.float32, device=device).reshape(-1, dynamics.state_dim)
+        times = torch.as_tensor(times, dtype=torch.float32, device=device).reshape(-1).expand(states.shape[0])
+        batch, count = states.shape[0], self.candidates.shape[0]
+        predicted = states.repeat_interleave(count, dim=0)
+        defender = self.candidates.repeat(batch, 1)
+        attacker = torch.zeros_like(defender)              # attacker keeps its current velocity
+        for _ in range(self.steps):
+            predicted = integrate_step(dynamics, predicted, attacker, defender, self.step_dt, 'euler')
+        if args.fixed_time_to_go is not None:
+            value_times = torch.full((batch * count,), float(args.fixed_time_to_go), device=device)
+        else:
+            value_times = torch.clamp(times.repeat_interleave(count) - self.steps * self.step_dt, min=0.0)
+        best = self._values(predicted, value_times).view(batch, count).argmax(dim=1)
+        query.disturbances = self.candidates[best]
+        return query
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+if args.defender_policy == 'lookahead':
+    responder = LookaheadDefenderResponder(responder, args.lookahead_time, dt)
 
 attacker_uses_mpc = args.controller in ('mpc', 'attacker_mpc', 'both_mpc')
 defender_uses_mpc = args.controller in ('defender_mpc', 'both_mpc')

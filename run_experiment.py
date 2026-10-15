@@ -131,6 +131,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_holdout_eval_epochs', type=int, default=5000, help='Epochs between evaluations on the held-out MPC games')
     p.add_argument('--mpc_labels_per_refresh', type=int, default=None, help='Store at most this many (randomly chosen) labels per MPC refresh')
     p.add_argument('--mpc_game_solver', type=str, default='maxmin', choices=['alternating', 'maxmin', 'mixed'], help="Joint MPC planner: 'maxmin' scores every attacker x defender plan pair and each player keeps its best worst-case plan; 'mixed' solves that table as a matrix game and samples each player's plan from its equilibrium mixture; 'alternating' best-responds to the opponent's current plan")
+    p.add_argument('--mpc_archive_size', type=int, default=0, help="'maxmin' solver: past plans per player (earlier picks and best counters) kept within one re-plan and added to every later table; the table grows to (samples + K)^2, 0 disables")
     p.add_argument('--mpc_use_network', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='false: joint MPC uses no network at all (zero initial plans, terminal-set margin as terminal value)')
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
     p.add_argument('--mpc_time_distribution', type=str, default='tmax', choices=['uniform', 'current_max', 'tmax'], help="Time-to-go of MPC initial states: 'current_max' starts every game at the current curriculum maximum, 'uniform' anywhere below it, 'tmax' at tMax (only after the curriculum)")
@@ -313,6 +314,7 @@ if (mode == 'all') or (mode == 'train'):
                 integration_method=mpc_options.mpc_integrator,
                 candidate_chunk_size=mpc_options.mpc_candidate_chunk_size,
                 control_hold_steps=getattr(mpc_options, 'mpc_control_hold_steps', 10),
+                archive_size=getattr(mpc_options, 'mpc_archive_size', 0),
                 **mpc_domain_constraint(dynamics, player, domain_mode, defender_keep_out),
             )
 

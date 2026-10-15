@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from controllers.bang_bang import BangBangQuery
@@ -523,6 +524,30 @@ def test_maxmin_picks_best_worst_case_plans_from_full_table():
     assert torch.allclose(result.upper_value, table.amax(2).amin(1))
     assert torch.allclose(result.lower_value, table.amin(1).amax(1))
     assert torch.all(result.upper_value >= result.lower_value - 1e-6)   # min-max >= max-min
+
+
+def test_maxmin_archive_only_adds_plans_and_requires_maxmin():
+    from dataclasses import replace
+    from controllers.mpc import closed_loop_rollout, optimize_maxmin_sequences
+    dynamics, responder, states, times, (att, dfn), nominal_u, nominal_d = _closed_loop_setup()
+    att, dfn = replace(att, num_iterations=1, num_samples=6), replace(dfn, num_iterations=1, num_samples=5)
+    plain = optimize_maxmin_sequences(states, times, nominal_u, nominal_d, None, dynamics, att, dfn,
+                                      generator=torch.Generator().manual_seed(7))
+    # in the first iteration the archive only holds copies of the warm start (candidate 0): same picks
+    archived = optimize_maxmin_sequences(states, times, nominal_u, nominal_d, None, dynamics,
+                                         replace(att, archive_size=3), replace(dfn, archive_size=2),
+                                         generator=torch.Generator().manual_seed(7))
+    assert torch.equal(plain.controls, archived.controls)
+    assert torch.equal(plain.defender_controls, archived.defender_controls)
+    assert archived.all_scores.shape[1] == (6 + 3) * (5 + 2)
+    longer = optimize_maxmin_sequences(states, times, nominal_u, nominal_d, None, dynamics,
+                                       replace(att, archive_size=3, num_iterations=4),
+                                       replace(dfn, archive_size=2, num_iterations=4),
+                                       generator=torch.Generator().manual_seed(7))
+    assert torch.all(longer.upper_value >= longer.lower_value - 1e-6)
+    with pytest.raises(ValueError):
+        closed_loop_rollout(states, times, nominal_u, nominal_d, None, dynamics, replace(att, archive_size=2), dfn,
+                            'joint', game_solver='mixed')
 
 
 def test_closed_loop_without_network_matches_exact_terminal_value():

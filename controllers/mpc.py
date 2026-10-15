@@ -27,6 +27,9 @@ class MPCConfig:
     # candidates entering it are rejected just like candidates leaving the domain
     keep_out_dims: Optional[tuple] = None
     keep_out_radius: Optional[float] = None
+    # max-min solver only: number of this player's past plans (earlier picks and best counters) kept for the
+    # rest of one re-plan and added to every later table, so a plan the opponent once beat stays tested
+    archive_size: int = 0
 
     def __post_init__(self):
         if self.dt <= 0:
@@ -49,6 +52,8 @@ class MPCConfig:
             raise ValueError("candidate_chunk_size must be >= 1 if provided")
         if self.control_hold_steps < 1:
             raise ValueError("control_hold_steps must be >= 1")
+        if self.archive_size < 0:
+            raise ValueError("archive_size must be >= 0")
 
 
 @dataclass
@@ -784,6 +789,13 @@ def optimize_maxmin_sequences(
     player (unless no candidate of that player is valid).
     attacker_config.candidate_chunk_size sets how many attacker plans are rolled out against all
     defender plans at once (default 8).
+    With config.archive_size = K > 0, that player also keeps an archive of K past plans for the rest of
+    this call: every iteration, its chosen plan and its best counter to the opponent's chosen plan are added
+    (oldest entries are overwritten; plans already in the table's archive or equal to the previous pick are
+    not added twice), and the archive is appended to every later candidate set. The opponent's later picks
+    are then still tested against them, which stops the two players from cycling between plans. The archive
+    starts filled with the warm-start plan and is not carried between calls. It enlarges the table to
+    (Na + Ka) x (Nd + Kd).
     Returns the rollout of the two chosen plans, with upper_value = min_i max_j M (what the attacker
     guarantees) and lower_value = max_j min_i M (what the defender guarantees) from the last table.
     """
@@ -807,6 +819,20 @@ def optimize_maxmin_sequences(
         return rollout.network_values[:, :, -1] if use_network else None
 
     attacker_plan, defender_plan = nominal_controls, nominal_disturbances
+    archives = {}   # player -> (plans [B, K, H, *], next slot to overwrite [B])
+    for player, config, plan in (("attacker", attacker_config, attacker_plan), ("defender", defender_config, defender_plan)):
+        if config.archive_size > 0:
+            archives[player] = (plan[:, None].repeat(1, config.archive_size, 1, 1),
+                                torch.zeros(batch_size, dtype=torch.long, device=initial_states.device))
+
+    def add_to_archive(player, plans, indices, is_new):
+        archive, slot = archives[player]
+        size = archive.shape[1]
+        position = slot % size
+        old = archive[batch_index, position]
+        archive[batch_index, position] = torch.where(is_new[:, None, None], plans[batch_index, indices], old)
+        archives[player] = (archive, slot + is_new.long())
+
     for _ in range(attacker_config.num_iterations):
         attacker_candidates = sample_control_sequences(
             attacker_plan, num_attacker, attacker_config.noise_std,
@@ -818,26 +844,31 @@ def optimize_maxmin_sequences(
             defender_config.control_lower, defender_config.control_upper, generator=generator,
             control_hold_steps=defender_config.control_hold_steps,
             include_axis_candidates=defender_config.include_axis_candidates)
+        if "attacker" in archives:
+            attacker_candidates = torch.cat((attacker_candidates, archives["attacker"][0]), dim=1)
+        if "defender" in archives:
+            defender_candidates = torch.cat((defender_candidates, archives["defender"][0]), dim=1)
+        table_rows, table_cols = attacker_candidates.shape[1], defender_candidates.shape[1]
 
         table, attacker_violation, defender_violation = [], [], []
-        for start in range(0, num_attacker, rows_per_chunk):
-            end = min(start + rows_per_chunk, num_attacker)
+        for start in range(0, table_rows, rows_per_chunk):
+            end = min(start + rows_per_chunk, table_rows)
             rows = end - start
             pair_controls = attacker_candidates[:, start:end, None].expand(
-                batch_size, rows, num_defender, horizon_steps, dynamics.control_dim
-            ).reshape(batch_size, rows * num_defender, horizon_steps, dynamics.control_dim)
+                batch_size, rows, table_cols, horizon_steps, dynamics.control_dim
+            ).reshape(batch_size, rows * table_cols, horizon_steps, dynamics.control_dim)
             pair_disturbances = defender_candidates[:, None].expand(
-                batch_size, rows, num_defender, horizon_steps, dynamics.disturbance_dim
-            ).reshape(batch_size, rows * num_defender, horizon_steps, dynamics.disturbance_dim)
+                batch_size, rows, table_cols, horizon_steps, dynamics.disturbance_dim
+            ).reshape(batch_size, rows * table_cols, horizon_steps, dynamics.disturbance_dim)
             rollout = rollout_joint_sequences(
                 initial_states, initial_times, pair_controls, pair_disturbances, responder, dynamics,
                 attacker_config.dt, attacker_config.integration_method, query_mode)
             scores, _ = evaluate_rollouts(dynamics, rollout, terminal(rollout))
-            table.append(scores.view(batch_size, rows, num_defender))
+            table.append(scores.view(batch_size, rows, table_cols))
             for violations, config in ((attacker_violation, attacker_config), (defender_violation, defender_config)):
                 violation = domain_violation(dynamics, config, rollout.states)
                 violations.append(torch.zeros_like(scores) if violation is None else violation)
-                violations[-1] = violations[-1].view(batch_size, rows, num_defender)
+                violations[-1] = violations[-1].view(batch_size, rows, table_cols)
 
         table = torch.cat(table, dim=1)                                           # [B, Na, Nd]
         attacker_violation = torch.cat(attacker_violation, dim=1).amax(dim=2)     # [B, Na]
@@ -848,8 +879,24 @@ def optimize_maxmin_sequences(
 
         attacker_worst = table.masked_fill(~defender_valid[:, None, :], float("-inf")).amax(dim=2)  # [B, Na]
         defender_worst = table.masked_fill(~attacker_valid[:, :, None], float("inf")).amin(dim=1)   # [B, Nd]
-        best_attacker = (attacker_worst + _violation_penalty(attacker_violation)).argmin(dim=1)
-        best_defender = (defender_worst - _violation_penalty(defender_violation)).argmax(dim=1)
+        attacker_penalty = _violation_penalty(attacker_violation)
+        defender_penalty = _violation_penalty(defender_violation)
+        best_attacker = (attacker_worst + attacker_penalty).argmin(dim=1)
+        best_defender = (defender_worst - defender_penalty).argmax(dim=1)
+        if archives:
+            # candidate 0 is the previous pick (already archived) and indices >= num_samples are archive entries
+            def fresh(indices, num_fresh):
+                return (indices > 0) & (indices < num_fresh)
+            if "attacker" in archives:   # attacker's best counter to the defender's pick
+                counter = (table[batch_index, :, best_defender] + attacker_penalty).argmin(dim=1)
+                add_to_archive("attacker", attacker_candidates, best_attacker, fresh(best_attacker, num_attacker))
+                add_to_archive("attacker", attacker_candidates, counter,
+                               fresh(counter, num_attacker) & (counter != best_attacker))
+            if "defender" in archives:   # defender's best counter to the attacker's pick
+                counter = (table[batch_index, best_attacker] - defender_penalty).argmax(dim=1)
+                add_to_archive("defender", defender_candidates, best_defender, fresh(best_defender, num_defender))
+                add_to_archive("defender", defender_candidates, counter,
+                               fresh(counter, num_defender) & (counter != best_defender))
         attacker_plan = attacker_candidates[batch_index, best_attacker]
         defender_plan = defender_candidates[batch_index, best_defender]
         upper_value = attacker_worst[batch_index, best_attacker]
@@ -1045,6 +1092,9 @@ def closed_loop_rollout(
     """
     if game_solver not in ("alternating", "maxmin", "mixed"):
         raise ValueError("game_solver must be 'alternating', 'maxmin' or 'mixed'")
+    if (attacker_config.archive_size or defender_config.archive_size) and (
+            game_solver != "maxmin" or optimized_player != "joint"):
+        raise ValueError("archive_size is only supported by the joint 'maxmin' solver")
     if responder is None and optimized_player != "joint":
         raise ValueError("a responder is required unless optimized_player is 'joint'")
     if optimized_player not in ("attacker", "defender", "joint"):

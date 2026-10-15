@@ -1,7 +1,7 @@
 """Compare joint closed-loop MPC settings by the game values they produce, against a strong reference.
 
 Every setting plays the same games the way training labels them: 'engagement' start states, game lengths
-uniform in [--min_length, tMax], closed-loop 'maxmin' MPC re-planning every mpc_replan_every steps, with no
+uniform in [--min_length, --max_length (default tMax)], closed-loop 'maxmin' MPC re-planning every mpc_replan_every steps, with no
 network (zero warm start, terminal-set margin at the end). The dynamics and the remaining MPC options (dt,
 horizon, noise, hold steps, domain constraint, keep-out, ring width, tMax) are taken from a training run.
 The value of a game is the reach-avoid label of its start state, so short games test labels with little time
@@ -164,7 +164,9 @@ def main():
     parser.add_argument('--cross_play', nargs='*', default=[], help='settings to cross-play against the reference')
     parser.add_argument('--integrator', default='rk4', choices=['euler', 'rk4'], help='default integrator of settings')
     parser.add_argument('--num_games', type=int, default=128)
-    parser.add_argument('--min_length', type=float, default=0.1, help='game lengths uniform in [min_length, tMax] (s)')
+    parser.add_argument('--min_length', type=float, default=0.1, help='game lengths uniform in [min_length, max_length] (s)')
+    parser.add_argument('--max_length', type=float, default=None,
+                        help='longest game (s), default the run\'s tMax; the MPC horizon is extended to cover it')
     parser.add_argument('--state_seed', type=int, default=0)
     parser.add_argument('--chunk', type=int, default=None, help='attacker plans per rollout chunk (memory)')
     parser.add_argument('--out_dir', default='mpc_compare')
@@ -173,12 +175,16 @@ def main():
 
     device = torch.device(args.device)
     dynamics, opt = load_run(args.experiments_dir, args.experiment_name)
-    if opt.mpc_horizon_steps * opt.mpc_dt < opt.tMax - 1e-6:
-        raise ValueError('mpc_horizon_steps * mpc_dt must cover tMax')
+    max_length = opt.tMax if args.max_length is None else args.max_length
+    if args.min_length > max_length:
+        raise ValueError('--min_length must not exceed the longest game')
+    # the plans must reach the end of the longest game (no network is used, so tMax itself does not matter)
+    opt = copy.copy(opt)
+    opt.mpc_horizon_steps = max(opt.mpc_horizon_steps, int(round(max_length / opt.mpc_dt)))
 
     # the start states fix everything the cached games depend on besides the setting and seed
     game_key = dict(experiment=args.experiment_name, num_games=args.num_games, min_length=args.min_length,
-                    state_seed=args.state_seed, tMax=opt.tMax)
+                    state_seed=args.state_seed, max_length=max_length)
     os.makedirs(args.out_dir, exist_ok=True)
     starts_path = os.path.join(args.out_dir, 'starts.pt')
     if os.path.exists(starts_path):
@@ -189,7 +195,7 @@ def main():
         torch.manual_seed(args.state_seed)
         starts = sample_mpc_initial_states(dynamics, args.num_games, 'engagement',
                                            defender_ring_width=getattr(opt, 'mpc_defender_ring_width', 1.0))
-        steps = torch.randint(int(round(args.min_length / opt.mpc_dt)), int(round(opt.tMax / opt.mpc_dt)) + 1,
+        steps = torch.randint(int(round(args.min_length / opt.mpc_dt)), int(round(max_length / opt.mpc_dt)) + 1,
                               (args.num_games,))
         saved = {'key': game_key, 'states': starts, 'times': steps * opt.mpc_dt}
         torch.save(saved, starts_path)
@@ -214,7 +220,7 @@ def main():
             label, agree, diff.mean(), diff.abs().mean(), above, seconds))
 
     print('\n%d games, lengths %.1f-%.1f s, reference %s; attacker wins in %.2f of reference games' % (
-        args.num_games, args.min_length, opt.tMax, setting_name(reference), (ref <= 0).float().mean()))
+        args.num_games, args.min_length, max_length, setting_name(reference), (ref <= 0).float().mean()))
     print('%-26s %6s %7s %6s %6s %8s' % ('setting', 'agree', 'bias', 'mae', '>U', 'sec'))
     row(setting_name(reference), ref, reference_runs[0]['seconds'])
     for seed, run in enumerate(reference_runs[1:], start=1):

@@ -468,3 +468,28 @@ def test_network_values_new_game_metrics_and_holdout(tmp_path):
     assert torch.equal(again['start_states'], holdout['start_states'])
     metrics = experiment._evaluate_mpc_holdout(holdout, 'cpu', epoch=7)
     assert 0.0 <= metrics['holdout/start_balanced_accuracy'] <= 1.0
+
+
+def test_mpc_library_overrides_and_game_check():
+    import argparse
+    import pytest
+    from dynamics.dynamics import CrazyflieInterception
+    from utils.mpc_library import apply_overrides, check_library_matches, game_parameters
+    opt = argparse.Namespace(tMax=2.0, vel_max_a=3.6, vel_max_d=None, box_loses=True, mpc_horizon_steps=100)
+    changed = apply_overrides(opt, ['tMax=3', 'vel_max_a=3.0', 'vel_max_d=3.0', 'box_loses=false',
+                                    'mpc_horizon_steps=150'])
+    assert (changed.tMax, changed.vel_max_a, changed.vel_max_d, changed.box_loses, changed.mpc_horizon_steps) == \
+        (3.0, 3.0, 3.0, False, 150)
+    assert opt.tMax == 2.0   # the original options are untouched
+    with pytest.raises(ValueError):
+        apply_overrides(opt, ['no_such_option=1'])
+
+    game = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.0, vel_max_d=3.0)
+    library = {'meta': {'game': game_parameters(game), 'tMax': 3.0}}
+    check_library_matches(library, game, 3.0)
+    check_library_matches(library, game, 2.0)   # a shorter run uses the labels it needs
+    with pytest.raises(ValueError):
+        check_library_matches(library, game, 3.5)
+    other = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.6, vel_max_d=3.0)
+    with pytest.raises(ValueError):
+        check_library_matches(library, other, 3.0)

@@ -238,6 +238,38 @@ def mpc_label_times(dynamics, result, initial_times, dt):
     return torch.where(ended_by_event[:, None], to_event, label_times)
 
 
+def mpc_label_mask(dynamics, result, initial_times, dt, drop_after_event=False, crop_to_domain=False):
+    """(label_times, keep), both [B, H+1]: the time-to-go of every state of MPC games and which states become
+    labels. Frozen states after an end-on-event stop or after the time-to-go ran out are dropped; with
+    drop_after_event (games played to the end) only states before the first capture / target hit / breach are
+    kept; with crop_to_domain only states inside the training domain."""
+    horizon_plus_one = result.states.shape[1]
+    label_times = mpc_label_times(dynamics, result, initial_times, dt)
+    steps = torch.arange(horizon_plus_one, device=label_times.device)[None]
+    keep = torch.ones_like(label_times, dtype=torch.bool)
+    event_steps = getattr(result, 'event_steps', None)
+    if event_steps is not None:   # states after the game ended are frozen duplicates: drop them
+        keep = steps <= event_steps[:, None]
+    elif drop_after_event:
+        decided = (dynamics.reach_fn(result.states) <= 0) | (dynamics.avoid_fn(result.states) <= 0)
+        first_event = torch.where(decided.any(dim=1), decided.float().argmax(dim=1),
+                                  torch.full_like(decided[:, 0], horizon_plus_one, dtype=torch.long))
+        keep = steps < first_event[:, None]
+    if crop_to_domain:   # labels were computed over the full game; only in-domain states are stored
+        keep = keep & in_domain_mask(dynamics, result.states)
+    # states after the time-to-go ran out are frozen copies of the last one: keep only the first
+    keep = keep & (steps * dt <= initial_times.reshape(-1, 1) + 1e-6)
+    return label_times, keep
+
+
+def cap_to_ceiling(dynamics, times, states, values, dt=0.02):
+    """(values lowered to the exact straight-flight ceiling dynamics.value_upper_bound, excess >= 0)."""
+    if values.numel() == 0:
+        return values, torch.zeros_like(values)
+    ceiling = dynamics.value_upper_bound(times, states, dt)
+    return torch.minimum(values, ceiling), (values - ceiling).clamp(min=0)
+
+
 def outcome_metrics(predicted, label):
     """How well predicted values match game outcomes. Sign <= 0 means attacker wins.
 

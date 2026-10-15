@@ -25,7 +25,7 @@ from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 from controllers.bang_bang import NeuralBangBangController
 from controllers.mpc import closed_loop_rollout, optimize_control_sequence, optimize_disturbance_sequence, optimize_joint_sequences, optimize_maxmin_sequences, optimize_mixed_sequences
-from utils.mpc_data import (MPCReplayBuffer, abs_error_by_time, in_domain_mask, mpc_label_times, outcome_metrics,
+from utils.mpc_data import (MPCReplayBuffer, abs_error_by_time, cap_to_ceiling, in_domain_mask, mpc_label_mask, mpc_label_times, outcome_metrics,
                             sample_mpc_initial_states, sample_mpc_initial_times)
 from utils.dataio import POINT_GROUPS
 
@@ -226,25 +226,8 @@ class Experiment(ABC):
         else:
             raise ValueError("optimized_player must be 'attacker', 'defender', or 'joint'")
 
-        horizon_plus_one = result.states.shape[1]
-        label_times = mpc_label_times(dynamics, result, times, mpc_config.dt)
-
-        keep = torch.ones_like(label_times, dtype=torch.bool)
-        event_steps = getattr(result, 'event_steps', None)
-        if event_steps is not None:   # states after the game ended are frozen duplicates: drop them
-            keep = torch.arange(horizon_plus_one, device=label_times.device)[None] <= event_steps[:, None]
-        elif drop_after_event:
-            # the game was played to the end (labels include what happens after the first capture / target
-            # hit / breach), but only the states before that first event are stored
-            decided = (dynamics.reach_fn(result.states) <= 0) | (dynamics.avoid_fn(result.states) <= 0)
-            first_event = torch.where(decided.any(dim=1), decided.float().argmax(dim=1),
-                                      torch.full_like(decided[:, 0], horizon_plus_one, dtype=torch.long))
-            keep = torch.arange(horizon_plus_one, device=label_times.device)[None] < first_event[:, None]
-        if crop_to_domain:   # labels were computed over the full game; only in-domain states are stored
-            keep = keep & in_domain_mask(dynamics, result.states)
-        # states after the time-to-go ran out are frozen copies of the last one: keep only the first
-        step_times = torch.arange(horizon_plus_one, device=label_times.device)[None] * mpc_config.dt
-        keep = keep & (step_times <= times[:, None] + 1e-6)
+        label_times, keep = mpc_label_mask(dynamics, result, times, mpc_config.dt,
+                                           drop_after_event=drop_after_event, crop_to_domain=crop_to_domain)
         if labels_per_refresh is not None and int(keep.sum()) > labels_per_refresh:
             kept = torch.nonzero(keep.reshape(-1)).squeeze(-1)
             chosen = kept[torch.randperm(kept.numel(), device=kept.device)[:labels_per_refresh]]
@@ -262,9 +245,8 @@ class Experiment(ABC):
             # a label above the exact straight-flight ceiling (network game, box rule included) is wrong
             # by proof: lower it to the ceiling
             for prefix in ('', 'start_'):
-                ceiling = self.dataset.dynamics.value_upper_bound(games[prefix + 'times'], games[prefix + 'states'])
-                excess = (games[prefix + 'values'] - ceiling).clamp(min=0)
-                games[prefix + 'values'] = torch.minimum(games[prefix + 'values'], ceiling)
+                games[prefix + 'values'], excess = cap_to_ceiling(
+                    self.dataset.dynamics, games[prefix + 'times'], games[prefix + 'states'], games[prefix + 'values'])
                 if prefix == '' and excess.numel():
                     cap_metrics = {'mpc_labels_capped_share': (excess > 1e-3).float().mean().item(),
                                    'mpc_labels_capped_mean_excess': excess.mean().item()}
@@ -541,7 +523,7 @@ class Experiment(ABC):
             mpc_holdout_games=0, mpc_holdout_eval_epochs=5000, mpc_cap_labels=False,
             mpc_defender_ring_width=1.0, mpc_drop_after_event=False,
             val_slice='zero_velocity', val_attacker_speed=2.0, val_defender_range=1.0,
-            value_ceiling_weight=0.0, monotonic_weight=0.0,
+            value_ceiling_weight=0.0, monotonic_weight=0.0, mpc_library=None,
         ):
         self.val_slice = dict(kind=val_slice, attacker_speed=val_attacker_speed, defender_range=val_defender_range)
         was_eval = not self.model.training
@@ -630,7 +612,7 @@ class Experiment(ABC):
             torch.set_rng_state(checkpoint['torch_random_state'])
             if torch.cuda.is_available() and checkpoint.get('cuda_random_state') is not None:
                 torch.cuda.set_rng_state_all(checkpoint['cuda_random_state'])
-            if (use_mpc_guidance and not mpc_reset_replay and
+            if (use_mpc_guidance and not mpc_reset_replay and mpc_library is None and
                     checkpoint.get('mpc_replay_buffer') is not None):
                 mpc_replay_buffer.load_state_dict(checkpoint['mpc_replay_buffer'])
             elif use_mpc_guidance and mpc_reset_replay:
@@ -661,8 +643,14 @@ class Experiment(ABC):
             labels_per_refresh=mpc_labels_per_refresh, cap_labels=mpc_cap_labels,
             defender_ring_width=mpc_defender_ring_width, drop_after_event=mpc_drop_after_event)
         mpc_holdout = None
-        if use_mpc_guidance and mpc_holdout_games > 0:
+        if use_mpc_guidance and mpc_library is not None and mpc_library.get('holdout') is not None:
+            mpc_holdout = mpc_library['holdout']   # played with the library's MPC, never trained on
+            print('Using the MPC library held-out set: %d games, %d labelled states' % (
+                mpc_holdout['start_values'].numel(), mpc_holdout['values'].numel()))
+        elif use_mpc_guidance and mpc_holdout_games > 0:
             mpc_holdout = self._prepare_mpc_holdout(device, refresh_kwargs, mpc_holdout_games)
+        # a fixed library is reloaded from its folder on resume, so checkpoints do not carry it
+        checkpoint_buffer = None if mpc_library is not None else mpc_replay_buffer
 
         def scheduled_lr(epoch):
             """Constant lr until lr_decay_start_epoch, then exponential decay reaching lr_final at the last epoch."""
@@ -682,7 +670,7 @@ class Experiment(ABC):
                         self.dataset.learned_boundary_fraction > 0 and
                         not epoch % self.dataset.learned_boundary_update_epochs):
                     self._update_learned_boundary_samples(device)
-                if (use_mpc_guidance and epoch >= mpc_start_epoch and
+                if (use_mpc_guidance and mpc_library is None and epoch >= mpc_start_epoch and
                     not self.dataset.pretrain and
                         not epoch % mpc_refresh_epochs):
                     optimized_players = (('attacker', 'defender')
@@ -1066,7 +1054,7 @@ class Experiment(ABC):
 
                 completed_epochs = epoch + 1
                 checkpoint = self._training_checkpoint(
-                    completed_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight, mpc_replay_buffer)
+                    completed_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight, checkpoint_buffer)
                 if (completed_epochs == 1 or
                         not completed_epochs % autosave_epochs or
                         not completed_epochs % epochs_til_checkpoint):
@@ -1084,7 +1072,7 @@ class Experiment(ABC):
         if mpc_holdout is not None:
             self._evaluate_mpc_holdout(mpc_holdout, device, target_epochs)
         final_checkpoint = self._training_checkpoint(
-            target_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight, mpc_replay_buffer)
+            target_epochs, total_steps, optim, train_losses, last_CSL_epoch, new_weight, checkpoint_buffer)
         self._atomic_torch_save(final_checkpoint, resume_checkpoint_path)
         self._atomic_torch_save(self.model.state_dict(), os.path.join(checkpoints_dir, 'model_final.pth'))
         writer.close()

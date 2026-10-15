@@ -131,6 +131,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_holdout_eval_epochs', type=int, default=5000, help='Epochs between evaluations on the held-out MPC games')
     p.add_argument('--mpc_labels_per_refresh', type=int, default=None, help='Store at most this many (randomly chosen) labels per MPC refresh')
     p.add_argument('--mpc_game_solver', type=str, default='maxmin', choices=['alternating', 'maxmin', 'mixed'], help="Joint MPC planner: 'maxmin' scores every attacker x defender plan pair and each player keeps its best worst-case plan; 'mixed' solves that table as a matrix game and samples each player's plan from its equilibrium mixture; 'alternating' best-responds to the opponent's current plan")
+    p.add_argument('--mpc_library_dir', type=str, default=None, help='Train on a fixed MPC label library built with utils/mpc_library.py (all labels loaded at the start, no refreshes, held-out set from the library); its game must match this run')
     p.add_argument('--mpc_archive_size', type=int, default=0, help="'maxmin' solver: past plans per player kept within one re-plan and added to every later table; the table grows to (samples + K)^2, 0 disables")
     p.add_argument('--mpc_pursuit', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help="'maxmin' solver: one candidate per player is always a straight pursuit plan (attacker at the target, defender at the attacker) and plans with equal worst case are ranked by the attacker's closest approach to the target (stops the attacker from idling when no sampled plan changes the score)")
     p.add_argument('--mpc_archive_mode', type=str, default='threats', choices=['threats', 'picks'], help="Which plans --mpc_archive_size keeps: 'threats' the worst-case plays against the opponent's 4 best plans (why the opponent prefers its pick), 'picks' the player's own picks and its best counter to the opponent's pick")
@@ -291,6 +292,7 @@ if (mode == 'all') or (mode == 'train'):
 
     mpc_config = None
     mpc_replay_buffer = None
+    mpc_library = None
     use_mpc_guidance = opt.use_mpc_guidance or getattr(orig_opt, 'use_mpc_guidance', False)
     mpc_options = opt if opt.use_mpc_guidance else orig_opt
     if use_mpc_guidance:
@@ -328,6 +330,16 @@ if (mode == 'all') or (mode == 'train'):
         }
         mpc_replay_buffer = MPCReplayBuffer(
             state_dim=dynamics.state_dim, capacity=mpc_options.mpc_replay_capacity)
+        if getattr(mpc_options, 'mpc_library_dir', None):
+            from utils.mpc_library import check_library_matches, load_library
+            mpc_library = load_library(mpc_options.mpc_library_dir)
+            check_library_matches(mpc_library, dynamics, orig_opt.tMax)
+            mpc_replay_buffer = MPCReplayBuffer(state_dim=dynamics.state_dim,
+                                                capacity=mpc_library['values'].numel())
+            mpc_replay_buffer.add(mpc_library['times'], mpc_library['states'], mpc_library['values'])
+            print('Loaded MPC library %s: %d chunks, %d labels (MPC %s); MPC refreshes are off' % (
+                mpc_options.mpc_library_dir, mpc_library['chunks'], len(mpc_replay_buffer),
+                mpc_library['meta']['mpc']['setting']))
 
     experiment.train(
         device=opt.device, batch_size=orig_opt.batch_size, epochs=orig_opt.num_epochs, lr=orig_opt.lr, 
@@ -349,6 +361,7 @@ if (mode == 'all') or (mode == 'train'):
         val_defender_range=getattr(opt, 'val_defender_range', 1.0),
         value_ceiling_weight=getattr(opt, 'value_ceiling_weight', 0.0),
         monotonic_weight=getattr(opt, 'monotonic_weight', 0.0),
+        mpc_library=mpc_library,
         use_mpc_guidance=use_mpc_guidance, mpc_config=mpc_config, mpc_replay_buffer=mpc_replay_buffer,
         mpc_num_initial_states=getattr(mpc_options, 'mpc_num_initial_states', 256),
         mpc_start_epoch=getattr(mpc_options, 'mpc_start_epoch', 0),

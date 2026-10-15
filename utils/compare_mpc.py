@@ -50,18 +50,31 @@ from dynamics import dynamics as dynamics_module
 from utils.mpc_data import mpc_domain_constraint, sample_mpc_initial_states
 
 
-def load_run(experiments_dir, experiment_name):
+def load_options(experiments_dir, experiment_name):
     with open(os.path.join(experiments_dir, experiment_name, 'orig_opt.pickle'), 'rb') as f:
-        opt = pickle.load(f)
+        return pickle.load(f)
+
+
+def build_dynamics(opt):
+    """The run's game dynamics from its options (the network's game, box rule included)."""
     dynamics_class = getattr(dynamics_module, opt.dynamics_class)
-    dynamics = dynamics_class(**{
+    return dynamics_class(**{
         name: getattr(opt, name)
         for name, param in inspect.signature(dynamics_class).parameters.items()
         if name != 'self' and (hasattr(opt, name) or param.default is inspect.Parameter.empty)})
-    if getattr(dynamics, 'box_loses', False):   # as in training: MPC players may leave the box
+
+
+def mpc_dynamics(dynamics):
+    """As in training: the MPC players may leave the box (their labels are cropped to the domain instead)."""
+    if getattr(dynamics, 'box_loses', False):
         dynamics = copy.copy(dynamics)
         dynamics.box_loses = False
-    return dynamics, opt
+    return dynamics
+
+
+def load_run(experiments_dir, experiment_name):
+    opt = load_options(experiments_dir, experiment_name)
+    return mpc_dynamics(build_dynamics(opt)), opt
 
 
 def parse_setting(text, default_integrator):

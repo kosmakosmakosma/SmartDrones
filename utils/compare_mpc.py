@@ -11,14 +11,17 @@ A setting is written SAMPLESxITERATIONS with optional suffixes -aK / -aKt (archi
 'threats' mode), -aKp (archive in 'picks' mode) and -euler / -rk4 (integrator; default --integrator),
 e.g. 32x10, 32x10-a8, 32x10-a8p, 32x15-euler.
 
-Reported per setting, against the reference (first seed):
+Reported per setting, against the reference V_ref = the mean of the reference's values over its
+--reference_seeds seeds (averaging lowers the reference's own randomness):
   agree    share of games with the same winner (V <= 0: the attacker wins)
   bias     mean (V - V_ref); > 0: the setting's games end better for the defender than the reference's
   mae      mean |V - V_ref|
-  >U       share of values above the straight-flight ceiling U (impossible: the attacker played badly)
+  >U       share of values above the straight-flight ceiling U (impossible for a perfect attacker)
+  >U+.01   share of values more than 0.01 above U
+  excess   mean (V - U) over the values above U
   sec      seconds to play all games
-'noise' rows compare the reference (or a setting) with itself under another sampling seed: differences
-smaller than the reference's own noise are not measurable with that reference.
+'noise' rows: each reference seed against the mean of the other reference seeds, and a setting's extra
+seeds against its seed 0. Differences smaller than the reference's own noise are not measurable with it.
 
 Cross-play (--cross_play SETTING ...): each player plans with its own solver (both solvers plan the whole game,
 each executes only its own player; the executed game uses rk4).
@@ -210,21 +213,28 @@ def main():
 
     reference = parse_setting(args.reference, args.integrator)
     reference_runs = [games(reference, reference, seed) for seed in range(args.reference_seeds)]
-    ref = reference_runs[0]['values']
+    reference_values = torch.stack([run['values'] for run in reference_runs])
+    ref = reference_values.mean(dim=0)
 
     def row(label, values, seconds, against=ref):
         diff = values - against
         agree = ((values <= 0) == (against <= 0)).float().mean()
-        above = (values > ceiling + 1e-4).float().mean()
-        print('%-26s %6.3f %+7.3f %6.3f %6.3f %8.0f' % (
-            label, agree, diff.mean(), diff.abs().mean(), above, seconds))
+        excess = values - ceiling
+        above = excess > 1e-4
+        mean_excess = excess[above].mean().item() if above.any() else 0.0
+        print('%-26s %6.3f %+7.3f %6.3f %6.3f %7.3f %7.3f %8.0f' % (
+            label, agree, diff.mean(), diff.abs().mean(), above.float().mean(), (excess > 0.01).float().mean(),
+            mean_excess, seconds))
 
-    print('\n%d games, lengths %.1f-%.1f s, reference %s; attacker wins in %.2f of reference games' % (
-        args.num_games, args.min_length, max_length, setting_name(reference), (ref <= 0).float().mean()))
-    print('%-26s %6s %7s %6s %6s %8s' % ('setting', 'agree', 'bias', 'mae', '>U', 'sec'))
-    row(setting_name(reference), ref, reference_runs[0]['seconds'])
-    for seed, run in enumerate(reference_runs[1:], start=1):
-        row('  noise: reference seed %d' % seed, run['values'], run['seconds'])
+    print('\n%d games, lengths %.1f-%.1f s, reference %s (mean of %d seeds); attacker wins in %.2f of reference games'
+          % (args.num_games, args.min_length, max_length, setting_name(reference), len(reference_runs),
+             (ref <= 0).float().mean()))
+    print('%-26s %6s %7s %6s %6s %7s %7s %8s' % ('setting', 'agree', 'bias', 'mae', '>U', '>U+.01', 'excess', 'sec'))
+    row(setting_name(reference) + ' (mean)', ref, sum(run['seconds'] for run in reference_runs))
+    if len(reference_runs) > 1:
+        for seed, run in enumerate(reference_runs):
+            others = torch.cat((reference_values[:seed], reference_values[seed + 1:])).mean(dim=0)
+            row('  noise: ref seed %d vs rest' % seed, run['values'], run['seconds'], against=others)
     for text in args.settings:
         setting = parse_setting(text, args.integrator)
         runs = [games(setting, setting, seed) for seed in range(args.setting_seeds)]

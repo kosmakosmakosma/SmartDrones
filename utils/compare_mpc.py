@@ -108,7 +108,7 @@ def make_configs(dynamics, opt, setting, chunk):
 
 
 def play(starts, times, dynamics, opt, attacker_setting, defender_setting, seed, chunk):
-    """Values of closed-loop games. With two different settings each one re-plans the whole game with its own
+    """(values [B], trajectories [B, H+1, S]) of closed-loop games. With two different settings each one re-plans the whole game with its own
     solver and warm starts, and only its own player executes its plan."""
     device = starts.device
     horizon, dt, replan_every = opt.mpc_horizon_steps, opt.mpc_dt, opt.mpc_replan_every
@@ -118,9 +118,10 @@ def play(starts, times, dynamics, opt, attacker_setting, defender_setting, seed,
     if attacker_setting == defender_setting:
         configs = make_configs(dynamics, opt, attacker_setting, chunk)
         generator = torch.Generator(device=device).manual_seed(seed)
-        return closed_loop_rollout(
+        result = closed_loop_rollout(
             starts, times, zeros_u, zeros_d, None, dynamics, configs['attacker'], configs['defender'], 'joint',
-            replan_every=replan_every, generator=generator, end_on_event=False, game_solver='maxmin').score
+            replan_every=replan_every, generator=generator, end_on_event=False, game_solver='maxmin')
+        return result.score, result.states
 
     solvers = []
     for index, setting in enumerate((attacker_setting, defender_setting)):
@@ -147,17 +148,61 @@ def play(starts, times, dynamics, opt, attacker_setting, defender_setting, seed,
         current_states = torch.where((current_times > 0)[:, None], next_states, current_states)
         current_times = torch.clamp(current_times - dt, min=0.0)
         states[:, step + 1] = current_states
-    return reach_avoid_suffix_values(dynamics, states)[:, 0]
+    return reach_avoid_suffix_values(dynamics, states)[:, 0], states
 
 
 def cached_values(path, compute):
     if os.path.exists(path):
         return torch.load(path)
     start = time.perf_counter()
-    values = compute().cpu()
-    result = {'values': values, 'seconds': time.perf_counter() - start}
+    values, states = compute()
+    result = {'values': values.cpu(), 'states': states.cpu(), 'seconds': time.perf_counter() - start}
     torch.save(result, path)
     return result
+
+
+def plot_games(path, game, runs, times, ceiling, dynamics, dt):
+    """One panel per run: attacker (red) and defender (blue) paths of one game, x = first capture,
+    * = first target hit, o = start."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    columns = min(4, len(runs))
+    rows = (len(runs) + columns - 1) // columns
+    figure, axes = plt.subplots(rows, columns, figsize=(4 * columns, 4 * rows), squeeze=False)
+    steps = int(round(float(times[game]) / dt)) + 1
+    limit = float(dynamics.state_var[0]) if hasattr(dynamics, 'state_var') else 2.0
+    for axis, (label, run) in zip(axes.flat, runs):
+        states = run['states'][game, :steps]
+        attacker, defender = states[:, [0, 2]], states[:, [4, 6]]
+        axis.add_patch(plt.Circle((0, 0), dynamics.target_R, color='green', alpha=0.3))
+        axis.add_patch(plt.Circle((0, 0), dynamics.defender_exclusion_R, color='gray', fill=False, linestyle='--'))
+        axis.plot(attacker[:, 0], attacker[:, 1], 'r-', lw=1.5, label='attacker')
+        axis.plot(defender[:, 0], defender[:, 1], 'b-', lw=1.5, label='defender')
+        axis.plot(attacker[0, 0], attacker[0, 1], 'ro')
+        axis.plot(defender[0, 0], defender[0, 1], 'bo')
+        captured = torch.nonzero((attacker - defender).norm(dim=-1) <= dynamics.capture_R)
+        if len(captured):
+            k = int(captured[0])
+            axis.plot(attacker[k, 0], attacker[k, 1], 'kx', ms=10, mew=2)
+            axis.add_patch(plt.Circle(tuple(defender[k].tolist()), dynamics.capture_R, color='blue', fill=False, lw=0.8))
+        hit = torch.nonzero(attacker.norm(dim=-1) <= dynamics.target_R)
+        if len(hit):
+            k = int(hit[0])
+            axis.plot(attacker[k, 0], attacker[k, 1], 'k*', ms=12)
+        axis.set_title('%s\nV = %+.3f  (U = %+.3f)' % (label, float(run['values'][game]), float(ceiling[game])),
+                       fontsize=9)
+        axis.set_xlim(-limit, limit)
+        axis.set_ylim(-limit, limit)
+        axis.set_aspect('equal')
+        axis.grid(alpha=0.3)
+    for axis in list(axes.flat)[len(runs):]:
+        axis.axis('off')
+    axes.flat[0].legend(fontsize=8, loc='upper left')
+    figure.suptitle('game %d, %.2f s' % (game, float(times[game])))
+    figure.tight_layout()
+    figure.savefig(path, dpi=110)
+    plt.close(figure)
 
 
 def main():
@@ -169,6 +214,9 @@ def main():
     parser.add_argument('--reference_seeds', type=int, default=2, help='>= 2 to measure the reference noise level')
     parser.add_argument('--setting_seeds', type=int, default=1, help='>= 2 to also report each setting\'s own noise')
     parser.add_argument('--cross_play', nargs='*', default=[], help='settings to cross-play against the reference')
+    parser.add_argument('--plot', type=int, default=0,
+                        help='plot this many games (those where the plotted runs disagree most) into OUT_DIR/plots')
+    parser.add_argument('--plot_games', type=int, nargs='*', default=[], help='game indices to plot (added to --plot)')
     parser.add_argument('--integrator', default='rk4', choices=['euler', 'rk4'], help='default integrator of settings')
     parser.add_argument('--num_games', type=int, default=128)
     parser.add_argument('--min_length', type=float, default=0.1, help='game lengths uniform in [min_length, max_length] (s)')
@@ -217,6 +265,7 @@ def main():
 
     reference = parse_setting(args.reference, args.integrator)
     reference_runs = [games(reference, reference, seed) for seed in range(args.reference_seeds)]
+    plotted = [(setting_name(reference) + ' seed 0', reference_runs[0])]
     reference_values = torch.stack([run['values'] for run in reference_runs])
     ref = reference_values.mean(dim=0)
 
@@ -243,6 +292,7 @@ def main():
         setting = parse_setting(text, args.integrator)
         runs = [games(setting, setting, seed) for seed in range(args.setting_seeds)]
         row(setting_name(setting), runs[0]['values'], runs[0]['seconds'])
+        plotted.append((setting_name(setting), runs[0]))
         for seed, run in enumerate(runs[1:], start=1):
             row('  noise: seed %d vs seed 0' % seed, run['values'], run['seconds'], against=runs[0]['values'])
 
@@ -252,11 +302,30 @@ def main():
         print('%-26s %8s %8s %8s %8s' % ('setting', 'att_gap', 'agree', 'def_gap', 'agree'))
         for text in args.cross_play:
             setting = parse_setting(text, args.integrator)
-            attacker_side = games(setting, reference, 0)['values']
-            defender_side = games(reference, setting, 0)['values']
+            attacker_run, defender_run = games(setting, reference, 0), games(reference, setting, 0)
+            plotted += [('attacker %s vs ref' % setting_name(setting), attacker_run),
+                        ('ref vs defender %s' % setting_name(setting), defender_run)]
+            attacker_side, defender_side = attacker_run['values'], defender_run['values']
             print('%-26s %+8.3f %8.3f %+8.3f %8.3f' % (
                 setting_name(setting), (attacker_side - ref).mean(), ((attacker_side <= 0) == (ref <= 0)).float().mean(),
                 (defender_side - ref).mean(), ((defender_side <= 0) == (ref <= 0)).float().mean()))
+
+    if args.plot or args.plot_games:
+        missing = [label for label, run in plotted if 'states' not in run]
+        if missing:
+            print('\nno trajectories saved for %s (played before trajectories were stored); delete their files '
+                  'in %s to replay them' % (', '.join(missing), args.out_dir))
+        plotted = [(label, run) for label, run in plotted if 'states' in run]
+        if plotted:
+            spread = torch.stack([run['values'] for _, run in plotted])
+            spread = spread.amax(dim=0) - spread.amin(dim=0)
+            chosen = list(dict.fromkeys(args.plot_games + spread.argsort(descending=True)[:args.plot].tolist()))
+            plot_dir = os.path.join(args.out_dir, 'plots')
+            os.makedirs(plot_dir, exist_ok=True)
+            for game in chosen:
+                plot_games(os.path.join(plot_dir, 'game_%03d.png' % game), game, plotted, times.cpu(), ceiling,
+                           dynamics, opt.mpc_dt)
+            print('\nplotted games %s (--plot_games first, then the largest value spread) into %s' % (chosen, plot_dir))
 
 
 if __name__ == '__main__':

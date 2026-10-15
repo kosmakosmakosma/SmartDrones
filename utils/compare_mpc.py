@@ -7,8 +7,9 @@ horizon, noise, hold steps, domain constraint, keep-out, ring width, tMax) are t
 The value of a game is the reach-avoid label of its start state, so short games test labels with little time
 left and long games labels with a lot.
 
-A setting is written SAMPLESxITERATIONS with optional suffixes -aK (archive of K plans per player) and
--euler / -rk4 (integrator; default --integrator), e.g. 32x10, 64x15-a8, 32x15-euler.
+A setting is written SAMPLESxITERATIONS with optional suffixes -aK / -aKt (archive of K plans per player,
+'threats' mode), -aKp (archive in 'picks' mode) and -euler / -rk4 (integrator; default --integrator),
+e.g. 32x10, 32x10-a8, 32x10-a8p, 32x15-euler.
 
 Reported per setting, against the reference (first seed):
   agree    share of games with the same winner (V <= 0: the attacker wins)
@@ -62,12 +63,15 @@ def load_run(experiments_dir, experiment_name):
 def parse_setting(text, default_integrator):
     parts = text.split('-')
     samples, iterations = (int(v) for v in parts[0].lower().split('x'))
-    setting = dict(samples=samples, iterations=iterations, archive=0, integrator=default_integrator)
+    setting = dict(samples=samples, iterations=iterations, archive=0, archive_mode='threats',
+                   integrator=default_integrator)
     for part in parts[1:]:
         if part in ('euler', 'rk4'):
             setting['integrator'] = part
         elif part.startswith('a'):
-            setting['archive'] = int(part[1:])
+            mode = {'t': 'threats', 'p': 'picks'}.get(part[-1])
+            setting['archive'] = int(part[1:-1] if mode else part[1:])
+            setting['archive_mode'] = mode or 'threats'
         else:
             raise ValueError('unknown setting suffix %r in %r' % (part, text))
     return setting
@@ -75,7 +79,7 @@ def parse_setting(text, default_integrator):
 
 def setting_name(setting):
     return '%dx%d%s-%s' % (setting['samples'], setting['iterations'],
-                           '-a%d' % setting['archive'] if setting['archive'] else '', setting['integrator'])
+                           '-a%d%s' % (setting['archive'], setting['archive_mode'][0]) if setting['archive'] else '', setting['integrator'])
 
 
 def make_configs(dynamics, opt, setting, chunk):
@@ -90,6 +94,7 @@ def make_configs(dynamics, opt, setting, chunk):
             control_lower=torch.full((dim,), -bound), control_upper=torch.full((dim,), bound),
             integration_method=setting['integrator'], candidate_chunk_size=chunk,
             control_hold_steps=getattr(opt, 'mpc_control_hold_steps', 10), archive_size=setting['archive'],
+            archive_mode=setting['archive_mode'],
             **mpc_domain_constraint(dynamics, player, getattr(opt, 'mpc_domain_constraint', 'none'),
                                     getattr(opt, 'mpc_defender_keep_out', False)))
     return configs

@@ -540,11 +540,12 @@ def test_maxmin_archive_only_adds_plans_and_requires_maxmin():
     assert torch.equal(plain.controls, archived.controls)
     assert torch.equal(plain.defender_controls, archived.defender_controls)
     assert archived.all_scores.shape[1] == (6 + 3) * (5 + 2)
-    longer = optimize_maxmin_sequences(states, times, nominal_u, nominal_d, None, dynamics,
-                                       replace(att, archive_size=3, num_iterations=4),
-                                       replace(dfn, archive_size=2, num_iterations=4),
-                                       generator=torch.Generator().manual_seed(7))
-    assert torch.all(longer.upper_value >= longer.lower_value - 1e-6)
+    for mode in ('threats', 'picks'):
+        longer = optimize_maxmin_sequences(states, times, nominal_u, nominal_d, None, dynamics,
+                                           replace(att, archive_size=3, archive_mode=mode, num_iterations=4),
+                                           replace(dfn, archive_size=2, archive_mode=mode, num_iterations=4),
+                                           generator=torch.Generator().manual_seed(7))
+        assert torch.all(longer.upper_value >= longer.lower_value - 1e-6)
     with pytest.raises(ValueError):
         closed_loop_rollout(states, times, nominal_u, nominal_d, None, dynamics, replace(att, archive_size=2), dfn,
                             'joint', game_solver='mixed')

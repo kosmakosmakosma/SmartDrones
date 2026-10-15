@@ -27,9 +27,13 @@ class MPCConfig:
     # candidates entering it are rejected just like candidates leaving the domain
     keep_out_dims: Optional[tuple] = None
     keep_out_radius: Optional[float] = None
-    # max-min solver only: number of this player's past plans (earlier picks and best counters) kept for the
-    # rest of one re-plan and added to every later table, so a plan the opponent once beat stays tested
+    # max-min solver only: number of this player's past plans kept for the rest of one re-plan and added to
+    # every later table. archive_mode 'threats': the plans that are the worst case for the opponent's
+    # archive_top best plans (the plays that justify the opponent's choice); 'picks': this player's own
+    # picks and its best counter to the opponent's pick
     archive_size: int = 0
+    archive_mode: str = "threats"
+    archive_top: int = 4
 
     def __post_init__(self):
         if self.dt <= 0:
@@ -54,6 +58,10 @@ class MPCConfig:
             raise ValueError("control_hold_steps must be >= 1")
         if self.archive_size < 0:
             raise ValueError("archive_size must be >= 0")
+        if self.archive_mode not in ("threats", "picks"):
+            raise ValueError("archive_mode must be 'threats' or 'picks'")
+        if self.archive_top < 1:
+            raise ValueError("archive_top must be >= 1")
 
 
 @dataclass
@@ -790,12 +798,15 @@ def optimize_maxmin_sequences(
     attacker_config.candidate_chunk_size sets how many attacker plans are rolled out against all
     defender plans at once (default 8).
     With config.archive_size = K > 0, that player also keeps an archive of K past plans for the rest of
-    this call: every iteration, its chosen plan and its best counter to the opponent's chosen plan are added
-    (oldest entries are overwritten; plans already in the table's archive or equal to the previous pick are
-    not added twice), and the archive is appended to every later candidate set. The opponent's later picks
-    are then still tested against them, which stops the two players from cycling between plans. The archive
-    starts filled with the warm-start plan and is not carried between calls. It enlarges the table to
-    (Na + Ka) x (Nd + Kd).
+    this call, appended to every later candidate set; each iteration adds plans to it (oldest entries are
+    overwritten, plans already in the archive are not added twice):
+      archive_mode 'threats': for each of the opponent's archive_top best plans (by their worst case), the
+        plan of this player that is that worst case. These are the plays that make the opponent prefer its
+        pick over its runner-ups; keeping them stops a runner-up from looking better later only because the
+        plan that punishes it was not sampled again.
+      archive_mode 'picks': this player's own pick and its best counter to the opponent's pick.
+    The archive starts filled with the warm-start plan and is not carried between calls. It enlarges the
+    table to (Na + Ka) x (Nd + Kd).
     Returns the rollout of the two chosen plans, with upper_value = min_i max_j M (what the attacker
     guarantees) and lower_value = max_j min_i M (what the defender guarantees) from the last table.
     """
@@ -877,22 +888,37 @@ def optimize_maxmin_sequences(
         attacker_valid = attacker_valid | ~attacker_valid.any(dim=1, keepdim=True)
         defender_valid = defender_valid | ~defender_valid.any(dim=1, keepdim=True)
 
-        attacker_worst = table.masked_fill(~defender_valid[:, None, :], float("-inf")).amax(dim=2)  # [B, Na]
-        defender_worst = table.masked_fill(~attacker_valid[:, :, None], float("inf")).amin(dim=1)   # [B, Nd]
+        # each plan's worst case and the opponent plan that causes it
+        attacker_worst, attacker_threat = table.masked_fill(~defender_valid[:, None, :], float("-inf")).max(dim=2)
+        defender_worst, defender_threat = table.masked_fill(~attacker_valid[:, :, None], float("inf")).min(dim=1)
         attacker_penalty = _violation_penalty(attacker_violation)
         defender_penalty = _violation_penalty(defender_violation)
         best_attacker = (attacker_worst + attacker_penalty).argmin(dim=1)
         best_defender = (defender_worst - defender_penalty).argmax(dim=1)
-        if archives:
+        for player, config, candidates, opponent_score, threat, num_fresh in (
+                ("attacker", attacker_config, attacker_candidates, -(defender_worst - defender_penalty),
+                 defender_threat, num_attacker),
+                ("defender", defender_config, defender_candidates, attacker_worst + attacker_penalty,
+                 attacker_threat, num_defender)):
+            if player not in archives or config.archive_mode != "threats":
+                continue
+            # the opponent's best plans (lowest score for it) and the plans of this player that punish them
+            top = opponent_score.topk(min(config.archive_top, opponent_score.shape[1]), dim=1, largest=False).indices
+            threats = threat[batch_index[:, None], top]                                   # [B, top]
+            for k in range(threats.shape[1]):   # indices >= num_fresh are archive entries already
+                is_new = (threats[:, k] < num_fresh) & ~(threats[:, :k] == threats[:, k:k + 1]).any(dim=1)
+                add_to_archive(player, candidates, threats[:, k], is_new)
+        if any(config.archive_mode == "picks" for player, config in
+               (("attacker", attacker_config), ("defender", defender_config)) if player in archives):
             # candidate 0 is the previous pick (already archived) and indices >= num_samples are archive entries
             def fresh(indices, num_fresh):
                 return (indices > 0) & (indices < num_fresh)
-            if "attacker" in archives:   # attacker's best counter to the defender's pick
+            if "attacker" in archives and attacker_config.archive_mode == "picks":
                 counter = (table[batch_index, :, best_defender] + attacker_penalty).argmin(dim=1)
                 add_to_archive("attacker", attacker_candidates, best_attacker, fresh(best_attacker, num_attacker))
                 add_to_archive("attacker", attacker_candidates, counter,
                                fresh(counter, num_attacker) & (counter != best_attacker))
-            if "defender" in archives:   # defender's best counter to the attacker's pick
+            if "defender" in archives and defender_config.archive_mode == "picks":
                 counter = (table[batch_index, best_attacker] - defender_penalty).argmax(dim=1)
                 add_to_archive("defender", defender_candidates, best_defender, fresh(best_defender, num_defender))
                 add_to_archive("defender", defender_candidates, counter,

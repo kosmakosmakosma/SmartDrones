@@ -268,7 +268,6 @@ class CrazyflieInterception(Dynamics):
         times = times.reshape(-1)
         position = states[..., [0, 2]].reshape(-1, 2).clone()
         velocity = states[..., [1, 3]].reshape(-1, 2).clone()
-        speed_limit = float('inf') if self.vel_max_a is None else float(self.vel_max_a)
         between_steps = self.accel_max_a * dt ** 2 / 8
 
         def attacker_outside_box(position, slack=0.0):
@@ -279,14 +278,8 @@ class CrazyflieInterception(Dynamics):
         worst_fail = torch.clamp(attacker_outside_box(position), min=self.capture_R)
         bound = torch.maximum(torch.linalg.vector_norm(position, dim=-1) - self.target_R, worst_fail)
         for step in range(1, int(math.ceil(float(times.max()) / dt - 1e-6)) + 1):
-            # desired velocity: top speed (or a large one) straight at the target centre
-            distance = torch.linalg.vector_norm(position, dim=-1, keepdim=True)
-            desired = -position / distance.clamp_min(1e-9) * min(speed_limit, 1e3)
-            # move the velocity toward the desired one, scaled uniformly so no axis exceeds accel_max_a;
-            # the new velocity lies between two velocities inside the speed disk, so it is inside too
-            change = desired - velocity
-            scale = torch.clamp(self.accel_max_a * dt / torch.amax(torch.abs(change), dim=-1, keepdim=True).clamp_min(1e-12), max=1.0)
-            acceleration = change * scale / dt
+            acceleration = self._steer(position, velocity, torch.zeros_like(position), self.accel_max_a,
+                                       self.vel_max_a, dt)
             position = position + velocity * dt + 0.5 * acceleration * dt ** 2
             velocity = velocity + acceleration * dt
             worst_fail = torch.maximum(worst_fail, attacker_outside_box(position, between_steps))
@@ -294,6 +287,46 @@ class CrazyflieInterception(Dynamics):
             active = step * dt <= times + 1e-9
             bound = torch.where(active, torch.minimum(bound, candidate), bound)
         return bound.reshape(states.shape[:-1])
+
+    @staticmethod
+    def _steer(position, velocity, aim, accel_max, vel_max, dt):
+        """Acceleration [..., 2] for one step of flying straight at `aim` at top speed (or a large one).
+
+        The velocity moves toward the desired one, scaled uniformly so no axis exceeds accel_max; the new
+        velocity lies between two velocities inside the speed disk, so it stays inside too.
+        """
+        offset = aim - position
+        distance = torch.linalg.vector_norm(offset, dim=-1, keepdim=True)
+        desired = offset / distance.clamp_min(1e-9) * min(float('inf') if vel_max is None else float(vel_max), 1e3)
+        change = desired - velocity
+        scale = torch.clamp(accel_max * dt / torch.amax(torch.abs(change), dim=-1, keepdim=True).clamp_min(1e-12),
+                            max=1.0)
+        return change * scale / dt
+
+    @torch.no_grad()
+    def pursuit_plans(self, states, horizon_steps, dt):
+        """Heuristic open-loop plans ([B, H, 2] each) used as MPC candidates: the attacker flies straight at the
+        target at top speed (the plan behind value_upper_bound); the defender flies at the attacker's position
+        along that path at the same time."""
+        attacker_position, attacker_velocity = states[:, [0, 2]].clone(), states[:, [1, 3]].clone()
+        defender_position, defender_velocity = states[:, [4, 6]].clone(), states[:, [5, 7]].clone()
+        attacker_plan, defender_plan = [], []
+        for _ in range(horizon_steps):
+            a = self._steer(attacker_position, attacker_velocity, torch.zeros_like(attacker_position),
+                            self.accel_max_a, self.vel_max_a, dt)
+            d = self._steer(defender_position, defender_velocity, attacker_position,
+                            self.accel_max_d, self.vel_max_d, dt)
+            attacker_plan.append(a)
+            defender_plan.append(d)
+            attacker_position = attacker_position + attacker_velocity * dt + 0.5 * a * dt ** 2
+            attacker_velocity = attacker_velocity + a * dt
+            defender_position = defender_position + defender_velocity * dt + 0.5 * d * dt ** 2
+            defender_velocity = defender_velocity + d * dt
+        return torch.stack(attacker_plan, dim=1), torch.stack(defender_plan, dim=1)
+
+    def attacker_target_margin(self, state):
+        """Attacker distance to the target edge (used by the MPC to break ties between equally scored plans)."""
+        return torch.linalg.vector_norm(state[..., [0, 2]], dim=-1) - self.target_R
 
     SPEED_LIMIT_TOLERANCE = 0.01   # m/s: within this of the limit a drone counts as being at it
 

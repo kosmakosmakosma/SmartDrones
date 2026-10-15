@@ -34,6 +34,12 @@ class MPCConfig:
     archive_size: int = 0
     archive_mode: str = "threats"
     archive_top: int = 4
+    # max-min solver only, needs dynamics.pursuit_plans / attacker_target_margin: one candidate of this player
+    # is always a heuristic plan (attacker: straight at the target; defender: straight at the attacker), and
+    # plans with the same worst case are ranked by how close the attacker gets to the target against that
+    # worst case (attacker: closer is better; defender: farther). Without the tie-break the attacker stays
+    # put whenever no sampled plan gets close enough to change the score.
+    pursuit: bool = False
 
     def __post_init__(self):
         if self.dt <= 0:
@@ -807,6 +813,9 @@ def optimize_maxmin_sequences(
       archive_mode 'picks': this player's own pick and its best counter to the opponent's pick.
     The archive starts filled with the warm-start plan and is not carried between calls. It enlarges the
     table to (Na + Ka) x (Nd + Kd).
+    With config.pursuit, that player's last fresh candidate is replaced by dynamics.pursuit_plans and its
+    pick among plans with the same worst case (within 1e-6) goes to the one with the smallest (attacker) or
+    largest (defender) closest attacker approach to the target against that worst case.
     Returns the rollout of the two chosen plans, with upper_value = min_i max_j M (what the attacker
     guarantees) and lower_value = max_j min_i M (what the defender guarantees) from the last table.
     """
@@ -844,6 +853,16 @@ def optimize_maxmin_sequences(
         archive[batch_index, position] = torch.where(is_new[:, None, None], plans[batch_index, indices], old)
         archives[player] = (archive, slot + is_new.long())
 
+    pursuit = {player: config.pursuit and hasattr(dynamics, "pursuit_plans")
+               for player, config in (("attacker", attacker_config), ("defender", defender_config))}
+    if any(pursuit.values()):
+        pursuit_plans = dict(zip(("attacker", "defender"),
+                                 dynamics.pursuit_plans(initial_states, horizon_steps, attacker_config.dt)))
+        for player, config in (("attacker", attacker_config), ("defender", defender_config)):
+            lower = torch.as_tensor(config.control_lower, device=initial_states.device)
+            upper = torch.as_tensor(config.control_upper, device=initial_states.device)
+            pursuit_plans[player] = torch.maximum(torch.minimum(pursuit_plans[player], upper), lower)
+
     for _ in range(attacker_config.num_iterations):
         attacker_candidates = sample_control_sequences(
             attacker_plan, num_attacker, attacker_config.noise_std,
@@ -855,13 +874,17 @@ def optimize_maxmin_sequences(
             defender_config.control_lower, defender_config.control_upper, generator=generator,
             control_hold_steps=defender_config.control_hold_steps,
             include_axis_candidates=defender_config.include_axis_candidates)
+        if pursuit["attacker"] and num_attacker > 1:
+            attacker_candidates[:, num_attacker - 1] = pursuit_plans["attacker"]
+        if pursuit["defender"] and num_defender > 1:
+            defender_candidates[:, num_defender - 1] = pursuit_plans["defender"]
         if "attacker" in archives:
             attacker_candidates = torch.cat((attacker_candidates, archives["attacker"][0]), dim=1)
         if "defender" in archives:
             defender_candidates = torch.cat((defender_candidates, archives["defender"][0]), dim=1)
         table_rows, table_cols = attacker_candidates.shape[1], defender_candidates.shape[1]
 
-        table, attacker_violation, defender_violation = [], [], []
+        table, attacker_violation, defender_violation, approach = [], [], [], []
         for start in range(0, table_rows, rows_per_chunk):
             end = min(start + rows_per_chunk, table_rows)
             rows = end - start
@@ -876,6 +899,9 @@ def optimize_maxmin_sequences(
                 attacker_config.dt, attacker_config.integration_method, query_mode)
             scores, _ = evaluate_rollouts(dynamics, rollout, terminal(rollout))
             table.append(scores.view(batch_size, rows, table_cols))
+            if any(pursuit.values()):   # closest attacker approach to the target in each pair's rollout
+                approach.append(dynamics.attacker_target_margin(rollout.states).amin(dim=-1)
+                                .view(batch_size, rows, table_cols))
             for violations, config in ((attacker_violation, attacker_config), (defender_violation, defender_config)):
                 violation = domain_violation(dynamics, config, rollout.states)
                 violations.append(torch.zeros_like(scores) if violation is None else violation)
@@ -893,8 +919,20 @@ def optimize_maxmin_sequences(
         defender_worst, defender_threat = table.masked_fill(~attacker_valid[:, :, None], float("inf")).min(dim=1)
         attacker_penalty = _violation_penalty(attacker_violation)
         defender_penalty = _violation_penalty(defender_violation)
-        best_attacker = (attacker_worst + attacker_penalty).argmin(dim=1)
-        best_defender = (defender_worst - defender_penalty).argmax(dim=1)
+        attacker_score = attacker_worst + attacker_penalty
+        defender_score = defender_worst - defender_penalty
+        best_attacker = attacker_score.argmin(dim=1)
+        best_defender = defender_score.argmax(dim=1)
+        if any(pursuit.values()):   # among equal worst cases, rank by the attacker's closest approach
+            approach = torch.cat(approach, dim=1)                                    # [B, rows, cols]
+            if pursuit["attacker"]:
+                tied = attacker_score <= attacker_score.amin(dim=1, keepdim=True) + 1e-6
+                closest = approach.gather(2, attacker_threat[:, :, None]).squeeze(2)
+                best_attacker = torch.where(tied, closest, torch.full_like(closest, float("inf"))).argmin(dim=1)
+            if pursuit["defender"]:
+                tied = defender_score >= defender_score.amax(dim=1, keepdim=True) - 1e-6
+                closest = approach.gather(1, defender_threat[:, None, :]).squeeze(1)
+                best_defender = torch.where(tied, closest, torch.full_like(closest, -float("inf"))).argmax(dim=1)
         for player, config, candidates, opponent_score, threat, num_fresh in (
                 ("attacker", attacker_config, attacker_candidates, -(defender_worst - defender_penalty),
                  defender_threat, num_attacker),

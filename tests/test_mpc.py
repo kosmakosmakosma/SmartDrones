@@ -626,3 +626,40 @@ def test_speed_limit_scales_velocity_back_along_its_direction():
     assert torch.allclose(integrate_step(dynamics, slow, torch.zeros(1, 2), torch.zeros(1, 2), 0.02, 'euler'), slow
                           + 0.02 * dynamics.dsdt(slow, torch.zeros(1, 2), torch.zeros(1, 2)))
     assert CrazyflieInterception(0.25, 0.2, 5.0, 7.0).limit_state(state) is state   # unlimited by default
+
+
+def test_pursuit_candidate_unsticks_attacker_below_the_ceiling():
+    """Without pursuit no sampled attacker plan gets close enough to change the score (all tie at the
+    defender's margin), so the attacker never commits; with it, the game value drops below the ceiling."""
+    from controllers.mpc import MPCConfig, closed_loop_rollout
+    from dynamics.dynamics import CrazyflieInterception
+    dynamics = CrazyflieInterception(0.25, 0.2, 5.0, 7.0, defender_exclusion_R=0.15, vel_max_a=2.0, vel_max_d=2.5)
+    states = torch.tensor([[0.79, 0.68, -1.36, -1.06, -0.46, 0.46, 0.01, -0.33],
+                           [-0.32, -1.56, 1.81, 0.03, -0.46, 0.54, 0.33, 0.37]])
+    times, horizon = torch.full((2,), 1.5), 75
+
+    def config(bound, pursuit):
+        return MPCConfig(dt=0.02, horizon_steps=horizon, num_samples=16, num_iterations=3, noise_std=0.25 * bound,
+                         control_lower=torch.full((2,), -bound), control_upper=torch.full((2,), bound),
+                         integration_method='rk4', control_hold_steps=10, keep_out_dims=(4, 6),
+                         keep_out_radius=0.15, pursuit=pursuit)
+
+    ceiling = dynamics.value_upper_bound(times, states)
+    scores = {}
+    for pursuit in (False, True):
+        scores[pursuit] = closed_loop_rollout(
+            states, times, torch.zeros(2, horizon, 2), torch.zeros(2, horizon, 2), None, dynamics,
+            config(5.0, pursuit), config(7.0, pursuit), 'joint', replan_every=5,
+            generator=torch.Generator().manual_seed(0), game_solver='maxmin').score
+    assert torch.all(scores[False] > ceiling + 0.05)
+    assert torch.all(scores[True] <= ceiling + 1e-4)
+
+
+def test_pursuit_plans_respect_limits():
+    from dynamics.dynamics import CrazyflieInterception
+    dynamics = CrazyflieInterception(0.25, 0.2, 5.0, 7.0, defender_exclusion_R=0.15, vel_max_a=2.0, vel_max_d=2.5)
+    states = torch.tensor([[1.5, 1.9, -1.0, 0.0, 0.3, -2.4, 0.5, 0.2]])
+    attacker, defender = dynamics.pursuit_plans(states, 50, 0.02)
+    assert attacker.abs().max() <= 5.0 + 1e-5 and defender.abs().max() <= 7.0 + 1e-5
+    velocity = states[:, [1, 3]] + torch.cumsum(attacker, dim=1) * 0.02
+    assert velocity.norm(dim=-1).max() <= 2.0 + 1e-4

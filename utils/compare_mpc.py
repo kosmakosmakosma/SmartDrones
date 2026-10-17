@@ -85,7 +85,7 @@ def parse_setting(text, default_integrator):
     samples, iterations = (int(v) for v in parts[0].lower().split('x'))
     setting = dict(samples=samples, iterations=iterations, archive=0, archive_mode='threats',
                    integrator=default_integrator, pursuit=True, chase=True,
-                   dodge=False)
+                   dodge=False, respond_top=0, respond_samples=0)
     for part in parts[1:]:
         if part == 'nopur':
             setting['pursuit'] = False
@@ -93,6 +93,9 @@ def parse_setting(text, default_integrator):
             setting['chase'] = False
         elif part in ('dodge', 'nododge'):
             setting['dodge'] = part == 'dodge'
+        elif part.startswith('resp'):   # respK or respKxR: attacker responds to the defender's K best plans
+            top, _, fresh = part[4:].partition('x')
+            setting['respond_top'], setting['respond_samples'] = int(top), int(fresh or 0)
         elif part in ('euler', 'rk4'):
             setting['integrator'] = part
         elif part.startswith('a'):
@@ -108,7 +111,10 @@ def setting_name(setting):
     archive = '-a%d%s' % (setting['archive'], setting['archive_mode'][0]) if setting['archive'] else ''
     return '%dx%d%s-%s%s' % (setting['samples'], setting['iterations'], archive, setting['integrator'],
                              ('-pur' if setting['pursuit'] else '') + ('-chase' if setting.get('chase') else '')
-                             + ('-dodge' if setting.get('dodge') else ''))
+                             + ('-dodge' if setting.get('dodge') else '')
+                             + ('-resp%d%s' % (setting['respond_top'], 'x%d' % setting['respond_samples']
+                                               if setting.get('respond_samples') else '')
+                                if setting.get('respond_top') else ''))
 
 
 def make_configs(dynamics, opt, setting, chunk):
@@ -126,6 +132,8 @@ def make_configs(dynamics, opt, setting, chunk):
             archive_mode=setting['archive_mode'], pursuit=setting['pursuit'],
             chase_top=4 if setting.get('chase') and player == 'defender' else 0,
             dodge=bool(setting.get('dodge')) and player == 'attacker',
+            respond_top=setting.get('respond_top', 0) if player == 'attacker' else 0,
+            respond_samples=setting.get('respond_samples', 0) if player == 'attacker' else 0,
             **mpc_domain_constraint(dynamics, player, getattr(opt, 'mpc_domain_constraint', 'none'),
                                     getattr(opt, 'mpc_defender_keep_out', False)))
     return configs

@@ -55,6 +55,12 @@ class MPCConfig:
     # a specific defender path, so without them the defender's plans look safer than they are)
     dodge: bool = False
     dodge_variants: int = 2
+    # max-min solver only, attacker config: at the end of every iteration the attacker re-picks its plan by the
+    # worst case against only the defender's respond_top best plans (instead of all defender candidates, which
+    # include chase plans tailored to each attacker plan) and tries respond_samples fresh variations of that
+    # pick against the same defender plans. 0 disables.
+    respond_top: int = 0
+    respond_samples: int = 0
 
     def __post_init__(self):
         if self.dt <= 0:
@@ -83,7 +89,8 @@ class MPCConfig:
             raise ValueError("archive_mode must be 'threats' or 'picks'")
         if self.archive_top < 1:
             raise ValueError("archive_top must be >= 1")
-        if (self.chase_top < 0 or self.chase_variants < 0 or self.dodge_variants < 0
+        if (self.chase_top < 0 or self.chase_variants < 0 or self.dodge_variants < 0 or self.respond_top < 0
+                or self.respond_samples < 0
                 or any(lead < 0 for lead in self.chase_leads)):
             raise ValueError("chase_top, chase_variants and chase_leads must be >= 0")
 
@@ -912,6 +919,37 @@ def optimize_maxmin_sequences(
         last = num_samples - (1 if pursuit[player] and num_samples > 1 else 0)
         candidates[:, last - heuristic.shape[1]:last] = heuristic
 
+    def respond_to_defender(table, attacker_candidates, defender_candidates, attacker_penalty, defender_score):
+        """The attacker's last word in an iteration: re-pick its plan by the worst case against only the defender's
+        respond_top best plans (by their worst case in this table), then try respond_samples fresh variations of
+        that pick against the same defender plans. Returns (attacker plan, its worst case against them)."""
+        count = min(attacker_config.respond_top, defender_score.shape[1])
+        top = defender_score.topk(count, dim=1).indices                                    # [B, K]
+        against = table.gather(2, top[:, None, :].expand(-1, table.shape[1], -1)).amax(dim=2) + attacker_penalty
+        pick = against.argmin(dim=1)
+        plan, score = attacker_candidates[batch_index, pick], against[batch_index, pick]
+        if attacker_config.respond_samples > 0:
+            fresh = sample_control_sequences(
+                plan, attacker_config.respond_samples, attacker_config.noise_std, attacker_config.control_lower,
+                attacker_config.control_upper, generator=generator,
+                control_hold_steps=attacker_config.control_hold_steps)                    # [B, R, H, U]
+            opponents = defender_candidates[batch_index[:, None], top]                     # [B, K, H, D]
+            rows = fresh.shape[1]
+            rollout = rollout_joint_sequences(
+                initial_states, initial_times,
+                fresh[:, :, None].expand(-1, -1, count, -1, -1).reshape(batch_size, rows * count, horizon_steps, -1),
+                opponents[:, None].expand(-1, rows, -1, -1, -1).reshape(batch_size, rows * count, horizon_steps, -1),
+                responder, dynamics, attacker_config.dt, attacker_config.integration_method, query_mode)
+            scores, _ = evaluate_rollouts(dynamics, rollout, terminal(rollout))
+            violation = domain_violation(dynamics, attacker_config, rollout.states)
+            penalty = 0 if violation is None else _violation_penalty(violation.view(batch_size, rows, count).amax(dim=2))
+            fresh_score = scores.view(batch_size, rows, count).amax(dim=2) + penalty
+            best_fresh = fresh_score.argmin(dim=1)
+            better = fresh_score[batch_index, best_fresh] < score
+            plan = torch.where(better[:, None, None], fresh[batch_index, best_fresh], plan)
+            score = torch.where(better, fresh_score[batch_index, best_fresh], score)
+        return plan, score
+
     for _ in range(attacker_config.num_iterations):
         attacker_candidates = sample_control_sequences(
             attacker_plan, num_attacker, attacker_config.noise_std,
@@ -1025,6 +1063,9 @@ def optimize_maxmin_sequences(
             chase_targets = attacker_candidates[batch_index[:, None], top]
         upper_value = attacker_worst[batch_index, best_attacker]
         lower_value = defender_worst[batch_index, best_defender]
+        if attacker_config.respond_top > 0:
+            attacker_plan, upper_value = respond_to_defender(
+                table, attacker_candidates, defender_candidates, attacker_penalty, defender_score)
 
     rollout = rollout_joint_sequences(
         initial_states, initial_times, attacker_plan[:, None], defender_plan[:, None], responder, dynamics,

@@ -689,3 +689,32 @@ def test_chase_plans_intercept_a_straight_attacker_and_keep_table_size():
                                        generator=torch.Generator().manual_seed(0))
     assert result.all_scores.shape[1] == 24 * 24
     assert result.lower_value.item() > 0   # with chase plans the defender holds this game
+
+
+def test_dodge_plans_reach_the_target_from_both_sides_and_keep_table_size():
+    from controllers.mpc import MPCConfig, optimize_maxmin_sequences
+    from dynamics.dynamics import CrazyflieInterception
+    dynamics = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.0, vel_max_d=3.0)
+    states = torch.tensor([[1.5, 0.0, 0.0, 0.0, 3.0, 0.0, 3.0, 0.0]])   # defender far away
+    horizon, dt = 100, 0.02
+    plans = dynamics.dodge_plans(states, horizon, dt)
+    assert plans.shape == (1, 8, horizon, 2) and plans.abs().max() <= 5.0 + 1e-5
+    position, velocity, closest, sides = states[:, [0, 2]].expand(8, 2).clone(), torch.zeros(8, 2), [], []
+    for k in range(horizon):
+        position = position + velocity * dt + 0.5 * plans[0, :, k] * dt ** 2
+        velocity = velocity + plans[0, :, k] * dt
+        closest.append(position.norm(dim=-1))
+        sides.append(position[:, 1])
+    assert torch.stack(closest).amin(dim=0).max() < 0.2          # every dodge plan ends in the target
+    sides = torch.stack(sides)
+    assert (sides.amin(dim=0) < -0.3).any() and (sides.amax(dim=0) > 0.3).any()   # around both sides
+
+    config = MPCConfig(dt=dt, horizon_steps=horizon, num_samples=24, num_iterations=2, noise_std=1.25,
+                       control_lower=torch.full((2,), -5.0), control_upper=torch.full((2,), 5.0),
+                       integration_method='rk4', control_hold_steps=10, pursuit=True)
+    attacker = MPCConfig(**{**config.__dict__, 'dodge': True})
+    result = optimize_maxmin_sequences(states, torch.full((1,), 2.0), torch.zeros(1, horizon, 2),
+                                       torch.zeros(1, horizon, 2), None, dynamics, attacker, config,
+                                       generator=torch.Generator().manual_seed(0))
+    assert result.all_scores.shape[1] == 24 * 24
+    assert result.upper_value.item() < 0   # the attacker reaches the target

@@ -364,6 +364,34 @@ class CrazyflieInterception(Dynamics):
             velocity = velocity + acceleration * dt
         return torch.stack(plan, dim=2)
 
+    @torch.no_grad()
+    def dodge_plans(self, states, horizon_steps, dt, angles_deg=(-90, -45, 45, 90), radii=(0.5, 0.9),
+                    switch_distance=0.25):
+        """Attacker plans [B, len(angles) * len(radii), H, 2] curving in to the target from either side: fly at
+        top speed at a point `radius` from the target centre, rotated by `angle` from the attacker's bearing,
+        then (once within switch_distance of it) straight at the target. Order: angle major, radius minor."""
+        speed = float('inf') if self.vel_max_a is None else float(self.vel_max_a)
+        bearing = torch.atan2(states[:, 2], states[:, 0])
+        angles = torch.tensor([math.radians(a) for a in angles_deg for _ in radii], device=states.device)
+        distances = torch.tensor([r for _ in angles_deg for r in radii], device=states.device)
+        heading = bearing[:, None] + angles[None]
+        waypoint = torch.stack((distances * torch.cos(heading), distances * torch.sin(heading)), dim=-1)  # [B, P, 2]
+        count = waypoint.shape[1]
+        position = states[:, None, [0, 2]].expand(-1, count, 2).clone()
+        velocity = states[:, None, [1, 3]].expand(-1, count, 2).clone()
+        switched = torch.zeros(position.shape[:2], dtype=torch.bool, device=states.device)
+        plan = []
+        for _ in range(horizon_steps):
+            switched = switched | (torch.linalg.vector_norm(position - waypoint, dim=-1) < switch_distance)
+            aim = torch.where(switched[..., None], torch.zeros_like(waypoint), waypoint)
+            acceleration = self._steer(position, velocity, aim, self.accel_max_a, self.vel_max_a, dt)
+            plan.append(acceleration)
+            position = position + velocity * dt + 0.5 * acceleration * dt ** 2
+            velocity = velocity + acceleration * dt
+            norm = torch.linalg.vector_norm(velocity, dim=-1, keepdim=True)
+            velocity = velocity * torch.clamp(speed / norm.clamp_min(1e-9), max=1.0)
+        return torch.stack(plan, dim=2)
+
     def attacker_target_margin(self, state):
         """Attacker distance to the target edge (used by the MPC to break ties between equally scored plans)."""
         return torch.linalg.vector_norm(state[..., [0, 2]], dim=-1) - self.target_R

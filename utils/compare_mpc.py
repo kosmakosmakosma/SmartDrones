@@ -11,8 +11,9 @@ A setting is written SAMPLESxITERATIONS with optional suffixes -aK / -aKt (archi
 'threats' mode), -aKp (archive in 'picks' mode) and -euler / -rk4 (integrator; default --integrator),
 e.g. 32x10, 32x10-a8, 32x10-a8p, 32x15-euler. Settings use the pursuit candidate and tie-break
 (MPCConfig.pursuit, shown as -pur in the name; -nopur turns them off) and the defender's chase candidates
-(MPCConfig.chase_top = 4, shown as -chase; -nochase turns them off) and the attacker's dodge candidates
-(MPCConfig.dodge, shown as -dodge; -nododge turns them off).
+(MPCConfig.chase_top = 4, shown as -chase; -nochase turns them off) and, only with the suffix -dodge, the
+attacker's dodge candidates (MPCConfig.dodge; off by default: in closed-loop cross-play they did not make the
+attacker stronger and made the planner's defender weaker).
 
 Reported per setting, against the reference V_ref = the mean of the reference's values over its
 --reference_seeds seeds (averaging lowers the reference's own randomness):
@@ -84,14 +85,14 @@ def parse_setting(text, default_integrator):
     samples, iterations = (int(v) for v in parts[0].lower().split('x'))
     setting = dict(samples=samples, iterations=iterations, archive=0, archive_mode='threats',
                    integrator=default_integrator, pursuit=True, chase=True,
-                   dodge=True)
+                   dodge=False)
     for part in parts[1:]:
         if part == 'nopur':
             setting['pursuit'] = False
         elif part == 'nochase':
             setting['chase'] = False
-        elif part == 'nododge':
-            setting['dodge'] = False
+        elif part in ('dodge', 'nododge'):
+            setting['dodge'] = part == 'dodge'
         elif part in ('euler', 'rk4'):
             setting['integrator'] = part
         elif part.startswith('a'):

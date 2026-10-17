@@ -663,3 +663,29 @@ def test_pursuit_plans_respect_limits():
     assert attacker.abs().max() <= 5.0 + 1e-5 and defender.abs().max() <= 7.0 + 1e-5
     velocity = states[:, [1, 3]] + torch.cumsum(attacker, dim=1) * 0.02
     assert velocity.norm(dim=-1).max() <= 2.0 + 1e-4
+
+
+def test_chase_plans_intercept_a_straight_attacker_and_keep_table_size():
+    from controllers.mpc import MPCConfig, optimize_maxmin_sequences, rollout_joint_sequences
+    from dynamics.dynamics import CrazyflieInterception
+    dynamics = CrazyflieInterception(0.2, 0.2, 5.0, 5.0, defender_exclusion_R=0.2, vel_max_a=3.0, vel_max_d=3.0)
+    # attacker crossing left to right above the target, defender below it at rest
+    states = torch.tensor([[-1.5, 2.0, 0.8, 0.0, 0.0, 0.0, -0.4, 0.0]])
+    horizon = 100
+    attacker = torch.zeros(1, 1, horizon, 2)                              # keeps flying straight
+    plans = dynamics.chase_plans(states, attacker, (0, 10, 25), 0.02)
+    assert plans.shape == (1, 3, horizon, 2) and plans.abs().max() <= 5.0 + 1e-5
+    rollout = rollout_joint_sequences(states, torch.full((1,), 2.0), attacker.expand(1, 3, horizon, 2), plans,
+                                      None, dynamics, 0.02, 'rk4', 'none')
+    gap = (rollout.states[..., [0, 2]] - rollout.states[..., [4, 6]]).norm(dim=-1).amin(dim=-1)
+    assert gap.min() <= dynamics.capture_R                                # some lead catches it
+
+    config = MPCConfig(dt=0.02, horizon_steps=horizon, num_samples=24, num_iterations=2, noise_std=1.25,
+                       control_lower=torch.full((2,), -5.0), control_upper=torch.full((2,), 5.0),
+                       integration_method='rk4', control_hold_steps=10, pursuit=True)
+    defender = MPCConfig(**{**config.__dict__, 'chase_top': 4})
+    result = optimize_maxmin_sequences(states, torch.full((1,), 2.0), torch.zeros(1, horizon, 2),
+                                       torch.zeros(1, horizon, 2), None, dynamics, config, defender,
+                                       generator=torch.Generator().manual_seed(0))
+    assert result.all_scores.shape[1] == 24 * 24
+    assert result.lower_value.item() > 0   # with chase plans the defender holds this game

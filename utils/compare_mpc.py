@@ -10,7 +10,8 @@ left and long games labels with a lot.
 A setting is written SAMPLESxITERATIONS with optional suffixes -aK / -aKt (archive of K plans per player,
 'threats' mode), -aKp (archive in 'picks' mode) and -euler / -rk4 (integrator; default --integrator),
 e.g. 32x10, 32x10-a8, 32x10-a8p, 32x15-euler. Settings use the pursuit candidate and tie-break
-(MPCConfig.pursuit, shown as -pur in the name); the suffix -nopur turns them off.
+(MPCConfig.pursuit, shown as -pur in the name; -nopur turns them off) and the defender's chase candidates
+(MPCConfig.chase_top = 4, shown as -chase; -nochase turns them off).
 
 Reported per setting, against the reference V_ref = the mean of the reference's values over its
 --reference_seeds seeds (averaging lowers the reference's own randomness):
@@ -81,10 +82,12 @@ def parse_setting(text, default_integrator):
     parts = text.split('-')
     samples, iterations = (int(v) for v in parts[0].lower().split('x'))
     setting = dict(samples=samples, iterations=iterations, archive=0, archive_mode='threats',
-                   integrator=default_integrator, pursuit=True)
+                   integrator=default_integrator, pursuit=True, chase=True)
     for part in parts[1:]:
         if part == 'nopur':
             setting['pursuit'] = False
+        elif part == 'nochase':
+            setting['chase'] = False
         elif part in ('euler', 'rk4'):
             setting['integrator'] = part
         elif part.startswith('a'):
@@ -99,7 +102,7 @@ def parse_setting(text, default_integrator):
 def setting_name(setting):
     archive = '-a%d%s' % (setting['archive'], setting['archive_mode'][0]) if setting['archive'] else ''
     return '%dx%d%s-%s%s' % (setting['samples'], setting['iterations'], archive, setting['integrator'],
-                             '-pur' if setting['pursuit'] else '')
+                             ('-pur' if setting['pursuit'] else '') + ('-chase' if setting.get('chase') else ''))
 
 
 def make_configs(dynamics, opt, setting, chunk):
@@ -115,6 +118,7 @@ def make_configs(dynamics, opt, setting, chunk):
             integration_method=setting['integrator'], candidate_chunk_size=chunk,
             control_hold_steps=getattr(opt, 'mpc_control_hold_steps', 10), archive_size=setting['archive'],
             archive_mode=setting['archive_mode'], pursuit=setting['pursuit'],
+            chase_top=4 if setting.get('chase') and player == 'defender' else 0,
             **mpc_domain_constraint(dynamics, player, getattr(opt, 'mpc_domain_constraint', 'none'),
                                     getattr(opt, 'mpc_defender_keep_out', False)))
     return configs

@@ -40,6 +40,15 @@ class MPCConfig:
     # worst case (attacker: closer is better; defender: farther). Without the tie-break the attacker stays
     # put whenever no sampled plan gets close enough to change the score.
     pursuit: bool = False
+    # max-min solver only, defender config, needs dynamics.chase_plans: every iteration, for each of the
+    # attacker's chase_top best plans (best worst case in the last table; first iteration: its warm start and
+    # straight pursuit plan) and each lead in chase_leads (steps), one defender plan flying at that attacker's
+    # planned position lead steps ahead, plus chase_variants noisy copies of each; they replace random samples
+    # (a random plan almost never intercepts, so without them the defender loses against every attacker plan
+    # and picks an arbitrary one). 0 disables.
+    chase_top: int = 0
+    chase_leads: tuple = (0, 10, 25)
+    chase_variants: int = 2
 
     def __post_init__(self):
         if self.dt <= 0:
@@ -68,6 +77,8 @@ class MPCConfig:
             raise ValueError("archive_mode must be 'threats' or 'picks'")
         if self.archive_top < 1:
             raise ValueError("archive_top must be >= 1")
+        if self.chase_top < 0 or self.chase_variants < 0 or any(lead < 0 for lead in self.chase_leads):
+            raise ValueError("chase_top, chase_variants and chase_leads must be >= 0")
 
 
 @dataclass
@@ -855,13 +866,41 @@ def optimize_maxmin_sequences(
 
     pursuit = {player: config.pursuit and hasattr(dynamics, "pursuit_plans")
                for player, config in (("attacker", attacker_config), ("defender", defender_config))}
-    if any(pursuit.values()):
+    chase = defender_config.chase_top > 0 and hasattr(dynamics, "chase_plans") and hasattr(dynamics, "pursuit_plans")
+    if any(pursuit.values()) or chase:
         pursuit_plans = dict(zip(("attacker", "defender"),
                                  dynamics.pursuit_plans(initial_states, horizon_steps, attacker_config.dt)))
         for player, config in (("attacker", attacker_config), ("defender", defender_config)):
             lower = torch.as_tensor(config.control_lower, device=initial_states.device)
             upper = torch.as_tensor(config.control_upper, device=initial_states.device)
             pursuit_plans[player] = torch.maximum(torch.minimum(pursuit_plans[player], upper), lower)
+
+    if chase:   # first iteration: chase the attacker's warm start and its straight pursuit plan
+        chase_targets = torch.stack((attacker_plan, pursuit_plans["attacker"]), dim=1)
+        reserved = (1 + (2 * dynamics.disturbance_dim if defender_config.include_axis_candidates else 0)
+                    + (1 if pursuit["defender"] else 0))   # current pick, axis plans, pursuit plan
+
+    def add_chase_candidates(candidates, targets):
+        """Overwrite the defender's last random samples with chase plans and their noisy copies."""
+        available = num_defender - reserved
+        if available < 1:
+            return
+        plans = dynamics.chase_plans(initial_states, targets, defender_config.chase_leads, attacker_config.dt)
+        lower = torch.as_tensor(defender_config.control_lower, device=plans.device)
+        upper = torch.as_tensor(defender_config.control_upper, device=plans.device)
+        plans = torch.maximum(torch.minimum(plans, upper), lower)[:, :available]
+        exact = plans.shape[1]
+        variants = min(defender_config.chase_variants, available // exact - 1)
+        heuristic = plans
+        if variants > 0:
+            noisy = sample_control_sequences(
+                plans.reshape(batch_size * exact, horizon_steps, dynamics.disturbance_dim), 1 + variants,
+                defender_config.noise_std, defender_config.control_lower, defender_config.control_upper,
+                generator=generator, control_hold_steps=defender_config.control_hold_steps)[:, 1:]
+            heuristic = torch.cat((plans, noisy.reshape(batch_size, exact * variants, horizon_steps,
+                                                        dynamics.disturbance_dim)), dim=1)
+        end = num_defender - (1 if pursuit["defender"] and num_defender > 1 else 0)
+        candidates[:, end - heuristic.shape[1]:end] = heuristic
 
     for _ in range(attacker_config.num_iterations):
         attacker_candidates = sample_control_sequences(
@@ -878,6 +917,8 @@ def optimize_maxmin_sequences(
             attacker_candidates[:, num_attacker - 1] = pursuit_plans["attacker"]
         if pursuit["defender"] and num_defender > 1:
             defender_candidates[:, num_defender - 1] = pursuit_plans["defender"]
+        if chase:
+            add_chase_candidates(defender_candidates, chase_targets)
         if "attacker" in archives:
             attacker_candidates = torch.cat((attacker_candidates, archives["attacker"][0]), dim=1)
         if "defender" in archives:
@@ -963,6 +1004,9 @@ def optimize_maxmin_sequences(
                                fresh(counter, num_defender) & (counter != best_defender))
         attacker_plan = attacker_candidates[batch_index, best_attacker]
         defender_plan = defender_candidates[batch_index, best_defender]
+        if chase:   # the attacker plans the defender must answer next: the best by worst case
+            top = attacker_score.topk(min(defender_config.chase_top, table_rows), dim=1, largest=False).indices
+            chase_targets = attacker_candidates[batch_index[:, None], top]
         upper_value = attacker_worst[batch_index, best_attacker]
         lower_value = defender_worst[batch_index, best_defender]
 

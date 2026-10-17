@@ -134,6 +134,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--mpc_library_dir', type=str, default=None, help='Train on a fixed MPC label library built with utils/mpc_library.py (all labels loaded at the start, no refreshes, held-out set from the library); its game must match this run')
     p.add_argument('--mpc_archive_size', type=int, default=0, help="'maxmin' solver: past plans per player kept within one re-plan and added to every later table; the table grows to (samples + K)^2, 0 disables")
     p.add_argument('--mpc_pursuit', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help="'maxmin' solver: one candidate per player is always a straight pursuit plan (attacker at the target, defender at the attacker) and plans with equal worst case are ranked by the attacker's closest approach to the target (stops the attacker from idling when no sampled plan changes the score)")
+    p.add_argument('--mpc_chase', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help="'maxmin' solver: every iteration the defender gets plans chasing the attacker's 4 best plans (leads 0, 0.2, 0.5 s) plus 2 noisy copies of each, replacing random samples")
     p.add_argument('--mpc_archive_mode', type=str, default='threats', choices=['threats', 'picks'], help="Which plans --mpc_archive_size keeps: 'threats' the worst-case plays against the opponent's 4 best plans (why the opponent prefers its pick), 'picks' the player's own picks and its best counter to the opponent's pick")
     p.add_argument('--mpc_use_network', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True, help='false: joint MPC uses no network at all (zero initial plans, terminal-set margin as terminal value)')
     p.add_argument('--mpc_replan_every', type=int, default=1, help='Steps between MPC re-plans in closed-loop rollouts')
@@ -321,6 +322,7 @@ if (mode == 'all') or (mode == 'train'):
                 archive_size=getattr(mpc_options, 'mpc_archive_size', 0),
                 archive_mode=getattr(mpc_options, 'mpc_archive_mode', 'threats'),
                 pursuit=getattr(mpc_options, 'mpc_pursuit', False),
+                chase_top=4 if player == 'defender' and getattr(mpc_options, 'mpc_chase', False) else 0,
                 **mpc_domain_constraint(dynamics, player, domain_mode, defender_keep_out),
             )
 

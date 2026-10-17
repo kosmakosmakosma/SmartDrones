@@ -324,6 +324,46 @@ class CrazyflieInterception(Dynamics):
             defender_velocity = defender_velocity + d * dt
         return torch.stack(attacker_plan, dim=1), torch.stack(defender_plan, dim=1)
 
+    @torch.no_grad()
+    def chase_plans(self, states, attacker_plans, leads, dt):
+        """Defender plans [B, K * len(leads), H, 2] that fly at the attacker's planned positions.
+
+        attacker_plans [B, K, H, 2]: the attacker's path under each plan is simulated alone (its motion does
+        not depend on the defender); for each plan and lead L (steps) the defender steers, every step k, at
+        the attacker's planned position at step k + L (aim points inside the defender's keep-out zone are
+        moved to its edge). Plan order: attacker plan major, lead minor.
+        """
+        batch, count, horizon, _ = attacker_plans.shape
+        speed_a = float('inf') if self.vel_max_a is None else float(self.vel_max_a)
+        position = states[:, None, [0, 2]].expand(batch, count, 2).clone()
+        velocity = states[:, None, [1, 3]].expand(batch, count, 2).clone()
+        path = [position]
+        for k in range(horizon):
+            acceleration = attacker_plans[:, :, k]
+            position = position + velocity * dt + 0.5 * acceleration * dt ** 2
+            velocity = velocity + acceleration * dt
+            speed = torch.linalg.vector_norm(velocity, dim=-1, keepdim=True)
+            velocity = velocity * torch.clamp(speed_a / speed.clamp_min(1e-9), max=1.0)
+            path.append(position)
+        path = torch.stack(path, dim=2)                                       # [B, K, H+1, 2]
+        keep_out = float(self.defender_exclusion_R) + 0.02
+        radius = torch.linalg.vector_norm(path, dim=-1, keepdim=True)
+        path = torch.where(radius < keep_out, path / radius.clamp_min(1e-9) * keep_out, path)
+
+        leads = torch.as_tensor(list(leads), dtype=torch.long, device=states.device)
+        aims = torch.stack([path[:, :, torch.clamp(torch.arange(horizon, device=states.device) + lead, max=horizon)]
+                            for lead in leads.tolist()], dim=2)              # [B, K, L, H, 2]
+        aims = aims.reshape(batch, count * len(leads), horizon, 2)
+        position = states[:, None, [4, 6]].expand(batch, aims.shape[1], 2).clone()
+        velocity = states[:, None, [5, 7]].expand(batch, aims.shape[1], 2).clone()
+        plan = []
+        for k in range(horizon):
+            acceleration = self._steer(position, velocity, aims[:, :, k], self.accel_max_d, self.vel_max_d, dt)
+            plan.append(acceleration)
+            position = position + velocity * dt + 0.5 * acceleration * dt ** 2
+            velocity = velocity + acceleration * dt
+        return torch.stack(plan, dim=2)
+
     def attacker_target_margin(self, state):
         """Attacker distance to the target edge (used by the MPC to break ties between equally scored plans)."""
         return torch.linalg.vector_norm(state[..., [0, 2]], dim=-1) - self.target_R

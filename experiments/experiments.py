@@ -119,7 +119,7 @@ class Experiment(ABC):
             time_distribution='uniform', rollout='open_loop', replan_every=1,
             end_on_event=False, game_solver='alternating', use_network=True, crop_to_domain=False,
             labels_per_refresh=None, fixed_start_time=None, log_new_games=True, cap_labels=False,
-            defender_ring_width=1.0, drop_after_event=False):
+            defender_ring_width=1.0, drop_after_event=False, box_rule=True):
         """Play MPC games, label their states and add them to `replay_buffer` (if given).
 
         Before the labels are added, the network's predictions on the new games are compared with their
@@ -127,9 +127,9 @@ class Experiment(ABC):
         Returns the kept labels and the games' starting states with their outcomes (CPU tensors).
         """
         dynamics = self.dataset.dynamics
-        if getattr(dynamics, 'box_loses', False):
-            # the MPC players may leave the box (their labels are cropped to the domain instead);
-            # only the network's game ends at the box
+        if getattr(dynamics, 'box_loses', False) and not box_rule:
+            # without the box rule the MPC players may leave the box (their labels are cropped to the domain
+            # instead) and only the network's game ends at the box
             dynamics = copy.copy(dynamics)
             dynamics.box_loses = False
         required_methods = ('reach_fn', 'avoid_fn', 'optimal_control', 'optimal_disturbance')
@@ -523,7 +523,7 @@ class Experiment(ABC):
             mpc_holdout_games=0, mpc_holdout_eval_epochs=5000, mpc_cap_labels=False,
             mpc_defender_ring_width=1.0, mpc_drop_after_event=False,
             val_slice='zero_velocity', val_attacker_speed=2.0, val_defender_range=1.0,
-            value_ceiling_weight=0.0, monotonic_weight=0.0, mpc_library=None,
+            value_ceiling_weight=0.0, monotonic_weight=0.0, mpc_library=None, mpc_box_rule=True,
         ):
         self.val_slice = dict(kind=val_slice, attacker_speed=val_attacker_speed, defender_range=val_defender_range)
         was_eval = not self.model.training
@@ -641,7 +641,8 @@ class Experiment(ABC):
             rollout=mpc_rollout, replan_every=mpc_replan_every, end_on_event=mpc_end_on_event,
             game_solver=mpc_game_solver, use_network=mpc_use_network, crop_to_domain=mpc_crop_to_domain,
             labels_per_refresh=mpc_labels_per_refresh, cap_labels=mpc_cap_labels,
-            defender_ring_width=mpc_defender_ring_width, drop_after_event=mpc_drop_after_event)
+            defender_ring_width=mpc_defender_ring_width, drop_after_event=mpc_drop_after_event,
+            box_rule=mpc_box_rule)
         mpc_holdout = None
         if use_mpc_guidance and mpc_library is not None and mpc_library.get('holdout') is not None:
             mpc_holdout = mpc_library['holdout']   # played with the library's MPC, never trained on

@@ -67,9 +67,10 @@ def build_dynamics(opt):
         if name != 'self' and (hasattr(opt, name) or param.default is inspect.Parameter.empty)})
 
 
-def mpc_dynamics(dynamics):
-    """As in training: the MPC players may leave the box (their labels are cropped to the domain instead)."""
-    if getattr(dynamics, 'box_loses', False):
+def mpc_dynamics(dynamics, box_rule=False):
+    """The game the MPC plays. box_rule: exactly the network's game (leaving the box loses for the leaver);
+    otherwise a copy without the box rule (the players may leave the box, labels are cropped to the domain)."""
+    if not box_rule and getattr(dynamics, 'box_loses', False):
         dynamics = copy.copy(dynamics)
         dynamics.box_loses = False
     return dynamics
@@ -246,6 +247,9 @@ def main():
     parser.add_argument('--reference_seeds', type=int, default=2, help='>= 2 to measure the reference noise level')
     parser.add_argument('--setting_seeds', type=int, default=1, help='>= 2 to also report each setting\'s own noise')
     parser.add_argument('--cross_play', nargs='*', default=[], help='settings to cross-play against the reference')
+    parser.add_argument('--box_rule', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True,
+                        help='the MPC plays the run\'s game including its box rule (leaving the box loses for the '
+                             'leaver); false: without it, as before')
     parser.add_argument('--plot', type=int, default=0,
                         help='plot this many games (those where the plotted runs disagree most) into OUT_DIR/plots')
     parser.add_argument('--plot_games', type=int, nargs='*', default=[], help='game indices to plot (added to --plot)')
@@ -261,7 +265,9 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    dynamics, opt = load_run(args.experiments_dir, args.experiment_name)
+    opt = load_options(args.experiments_dir, args.experiment_name)
+    game = build_dynamics(opt)                      # the network's game: the ceiling includes its box rule
+    dynamics = mpc_dynamics(game, args.box_rule)
     max_length = opt.tMax if args.max_length is None else args.max_length
     if args.min_length > max_length:
         raise ValueError('--min_length must not exceed the longest game')
@@ -271,7 +277,8 @@ def main():
 
     # the start states fix everything the cached games depend on besides the setting and seed
     game_key = dict(experiment=args.experiment_name, num_games=args.num_games, min_length=args.min_length,
-                    state_seed=args.state_seed, max_length=max_length)
+                    state_seed=args.state_seed, max_length=max_length,
+                    box_rule=args.box_rule)
     os.makedirs(args.out_dir, exist_ok=True)
     starts_path = os.path.join(args.out_dir, 'starts.pt')
     if os.path.exists(starts_path):
@@ -287,7 +294,7 @@ def main():
         saved = {'key': game_key, 'states': starts, 'times': steps * opt.mpc_dt}
         torch.save(saved, starts_path)
     starts, times = saved['states'].to(device), saved['times'].to(device)
-    ceiling = dynamics.value_upper_bound(times.cpu(), starts.cpu(), opt.mpc_dt)
+    ceiling = game.value_upper_bound(times.cpu(), starts.cpu(), opt.mpc_dt)
 
     def games(attacker, defender, seed):
         name = setting_name(attacker) + ('' if attacker == defender else '_vs_' + setting_name(defender))

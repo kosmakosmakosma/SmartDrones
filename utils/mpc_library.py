@@ -120,7 +120,7 @@ def build(args):
     opt = apply_overrides(load_options(args.experiments_dir, args.experiment_name), args.override)
     opt.mpc_horizon_steps = max(opt.mpc_horizon_steps, int(math.ceil(opt.tMax / opt.mpc_dt - 1e-6)))
     game = build_dynamics(opt)
-    players = mpc_dynamics(game)
+    players = mpc_dynamics(game, args.box_rule)
     setting = parse_setting(args.setting, args.integrator)
     meta = {
         'game': game_parameters(game), 'tMax': opt.tMax, 'dt': opt.mpc_dt,
@@ -132,7 +132,8 @@ def build(args):
         'games': dict(per_chunk=args.games_per_chunk, full_length_share=args.full_length_share,
                       min_length=args.min_length, starts='engagement',
                       defender_ring_width=getattr(opt, 'mpc_defender_ring_width', 1.0),
-                      crop_to_domain=getattr(opt, 'mpc_crop_to_domain', True), drop_after_event=True, capped=True),
+                      crop_to_domain=getattr(opt, 'mpc_crop_to_domain', True), drop_after_event=True, capped=True,
+                      box_rule=args.box_rule),
         'base_experiment': args.experiment_name, 'overrides': args.override, 'holdout_games': args.holdout_games,
     }
     os.makedirs(args.library_dir, exist_ok=True)
@@ -225,6 +226,9 @@ def main():
     parser.add_argument('--full_length_share', type=float, default=0.5, help='share of games lasting the full tMax')
     parser.add_argument('--min_length', type=float, default=0.1, help='shortest game of the others (s)')
     parser.add_argument('--holdout_games', type=int, default=512)
+    parser.add_argument('--box_rule', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True,
+                        help='the MPC plays the run\'s game including its box rule (leaving the box loses for the '
+                             'leaver); false: without it (the players may leave, labels cropped to the domain)')
     parser.add_argument('--chunk', type=int, default=32, help='attacker plans per rollout batch (GPU memory)')
     parser.add_argument('--workers', type=int, default=1)
     parser.add_argument('--worker', type=int, default=0)

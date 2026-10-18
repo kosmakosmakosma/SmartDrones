@@ -52,7 +52,8 @@ def main():
     name = args.file or 'chunk_%05d.pt' % args.chunk
     chunk = torch.load(os.path.join(args.library_dir, name), map_location='cpu')
     with open(os.path.join(args.library_dir, 'meta.json')) as f:
-        game = json.load(f)['game']
+        meta = json.load(f)
+    game, dt = meta['game'], meta['dt']
     spans = split_games(chunk)
     chosen = list(range(args.first_game, min(args.first_game + args.games, len(spans))))
 
@@ -68,8 +69,12 @@ def main():
         else:
             states, values = chunk['states'][span[0]:span[1]], chunk['values'][span[0]:span[1]]
             attacker, defender = states[:, [0, 2]], states[:, [4, 6]]
-            axis.plot(attacker[:, 0], attacker[:, 1], 'r-', lw=1, alpha=0.6)
-            axis.plot(defender[:, 0], defender[:, 1], 'b-', lw=1.5)
+            # states outside the domain are not stored: break the paths where time jumps instead of joining them
+            times = chunk['times'][span[0]:span[1]]
+            breaks = (torch.nonzero((times[:-1] - times[1:]) > 1.5 * dt).flatten() + 1).tolist()
+            for begin, end in zip([0] + breaks, breaks + [len(times)]):
+                axis.plot(attacker[begin:end, 0], attacker[begin:end, 1], 'r-', lw=1, alpha=0.6)
+                axis.plot(defender[begin:end, 0], defender[begin:end, 1], 'b-', lw=1.5)
             axis.scatter(attacker[:, 0], attacker[:, 1], c=values, cmap='coolwarm_r', vmin=-0.25, vmax=0.25, s=8,
                          zorder=3)
             axis.plot(attacker[0, 0], attacker[0, 1], 'ro')

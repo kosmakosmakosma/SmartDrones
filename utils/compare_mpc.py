@@ -11,7 +11,7 @@ A setting is written SAMPLESxITERATIONS with optional suffixes -aK / -aKt (archi
 'threats' mode), -aKp (archive in 'picks' mode) and -euler / -rk4 (integrator; default --integrator),
 e.g. 32x10, 32x10-a8, 32x10-a8p, 32x15-euler. Settings use the pursuit candidate and tie-break
 (MPCConfig.pursuit, shown as -pur in the name; -nopur turns them off) and the defender's chase candidates
-(MPCConfig.chase_top = 4, shown as -chase; -nochase turns them off) and, only with the suffix -dodge, the
+(MPCConfig.chase_top = 4 with leads 0 / 10 / 25 / 50 steps, shown as -chase50; -nochase turns them off) and, only with the suffix -dodge, the
 attacker's dodge candidates (MPCConfig.dodge; off by default: in closed-loop cross-play they did not make the
 attacker stronger and made the planner's defender weaker).
 
@@ -111,7 +111,7 @@ def parse_setting(text, default_integrator):
 def setting_name(setting):
     archive = '-a%d%s' % (setting['archive'], setting['archive_mode'][0]) if setting['archive'] else ''
     return '%dx%d%s-%s%s' % (setting['samples'], setting['iterations'], archive, setting['integrator'],
-                             ('-pur' if setting['pursuit'] else '') + ('-chase' if setting.get('chase') else '')
+                             ('-pur' if setting['pursuit'] else '') + ('-chase50' if setting.get('chase') else '')
                              + ('-dodge' if setting.get('dodge') else '')
                              + ('-resp%d%s' % (setting['respond_top'], 'x%d' % setting['respond_samples']
                                                if setting.get('respond_samples') else '')

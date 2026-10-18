@@ -47,7 +47,7 @@ class MPCConfig:
     # (a random plan almost never intercepts, so without them the defender loses against every attacker plan
     # and picks an arbitrary one). 0 disables.
     chase_top: int = 0
-    chase_leads: tuple = (0, 10, 25)
+    chase_leads: tuple = (0, 10, 25, 50)
     chase_variants: int = 2
     # max-min solver only, attacker config, needs dynamics.dodge_plans: every iteration the attacker's candidates
     # include plans curving in to the target from either side (via points beside the target) plus

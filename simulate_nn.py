@@ -28,6 +28,7 @@ from controllers.mpc import (
     optimize_control_sequence,
     optimize_disturbance_sequence,
     optimize_joint_sequences,
+    optimize_maxmin_sequences,
     shift_control_sequence,
 )
 
@@ -75,6 +76,16 @@ parser.add_argument('--lookahead_time', type=float, default=0.2, help='predictio
 parser.add_argument('--mpc_replan_every', type=int, default=1,
                     help='MPC player(s) re-optimise every N simulation steps and follow their plan in between; '
                          'the network player always acts on the actual state')
+parser.add_argument('--mpc_opponent_model', type=str, default='network', choices=['network', 'mpc'],
+                    help="'network': the MPC player simulates the network opponent inside its plans and ends them in the "
+                         "network's value (it can exploit the network); 'mpc': the MPC player knows nothing about the "
+                         "network: it plans the whole remaining game with the library's max-min MPC for both players "
+                         "(pursuit, defender chase plans, the run's box rule, no network) and only its own moves are "
+                         "executed")
+parser.add_argument('--mpc_chase', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True,
+                    help="with --mpc_opponent_model mpc: the planner's defender gets chase plans (as in the library)")
+parser.add_argument('--start', type=float, nargs=8, default=None,
+                    help='start state px_a vx_a py_a vy_a px_d vx_d py_d vy_d (default: the hard-coded state0)')
 args = parser.parse_args()
 
 experiment_dir = os.path.join(args.experiments_dir, args.experiment_name)
@@ -257,6 +268,42 @@ if (attacker_uses_mpc or defender_uses_mpc) and args.mpc_seed is not None:
     mpc_generator.manual_seed(args.mpc_seed)
 
 
+independent_mpc = args.mpc_opponent_model == 'mpc' and args.controller in ('mpc', 'attacker_mpc', 'defender_mpc')
+independent_plans = {'u': None, 'd': None, 'start': 0}
+
+
+def independent_mpc_actions(state_np, step):
+    """Both players' actions from the MPC's own plan of the whole remaining game (max-min, no network)."""
+    remaining = n_steps - step
+    offset = step - independent_plans['start']
+    if independent_plans['u'] is None or step % max(args.mpc_replan_every, 1) == 0:
+        state = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
+        if independent_plans['u'] is None:
+            plan_u = torch.zeros(1, remaining, dynamics.control_dim, device=device)
+            plan_d = torch.zeros(1, remaining, dynamics.disturbance_dim, device=device)
+        else:   # receding horizon: drop the executed part, plans end with the game
+            plan_u = independent_plans['u'][:, offset:offset + remaining]
+            plan_d = independent_plans['d'][:, offset:offset + remaining]
+        configs = []
+        for bound, dim, player in ((accel_max_a, dynamics.control_dim, 'attacker'),
+                                   (accel_max_d, dynamics.disturbance_dim, 'defender')):
+            noise_std = args.mpc_noise_std if args.mpc_noise_std is not None else args.mpc_noise_fraction * bound
+            keep_out = (dict(keep_out_dims=(4, 6), keep_out_radius=float(defender_exclusion_R))
+                        if player == 'defender' else {})
+            configs.append(MPCConfig(
+                dt=dt, horizon_steps=remaining, num_samples=args.mpc_num_samples, num_iterations=args.mpc_iterations,
+                noise_std=noise_std, control_lower=torch.full((dim,), -bound), control_upper=torch.full((dim,), bound),
+                integration_method=args.mpc_integrator, candidate_chunk_size=args.mpc_candidate_chunk_size,
+                control_hold_steps=args.mpc_control_hold_steps, pursuit=True,
+                chase_top=4 if (player == 'defender' and args.mpc_chase) else 0, **keep_out))
+        result = optimize_maxmin_sequences(
+            state, torch.tensor([remaining * dt], device=device), plan_u, plan_d, None, dynamics,
+            configs[0], configs[1], generator=mpc_generator)
+        independent_plans.update(u=result.controls.detach(), d=result.defender_controls.detach(), start=step)
+        offset = 0
+    return (independent_plans['u'][0, offset].cpu().numpy(), independent_plans['d'][0, offset].cpu().numpy())
+
+
 def query_value(state_np, tau):
     state_tensor = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
     query = responder.query(state_tensor, torch.tensor([tau], dtype=torch.float32, device=device))
@@ -268,6 +315,13 @@ def query_controls(state_np, tau, step=0):
     global nominal_attacker_controls, nominal_defender_controls
     state_tensor = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
     time_tensor = torch.tensor([tau], dtype=torch.float32, device=device)
+
+    if independent_mpc:   # the MPC player plans with its own model of the opponent, the network player reacts
+        u_mpc, d_mpc = independent_mpc_actions(state_np, step)
+        query = responder.query(state_tensor, time_tensor)
+        u = u_mpc if attacker_uses_mpc else query.controls[0].detach().cpu().numpy()
+        d = d_mpc if defender_uses_mpc else query.disturbances[0].detach().cpu().numpy()
+        return u, d, query.values[0].detach().cpu().item()
 
     have_plans = ((not attacker_uses_mpc or nominal_attacker_controls is not None)
                   and (not defender_uses_mpc or nominal_defender_controls is not None))
@@ -341,6 +395,8 @@ state0 = np.array([
     0.0,  0.1,    # defender: x=-1.0m, vx=0
     0.7,  0.0,    # defender: y=0.5m, vy=0
 ])
+if args.start is not None:
+    state0 = np.array(args.start, dtype=float)
 
 # ──────────────────────────────────────────────────
 # Simulate
@@ -410,6 +466,17 @@ for i in range(n_steps):
         break
     if dist_to_defender <= capture_R:
         outcome = "captured"
+        outcome_time = times[i + 1]
+        trajectory = trajectory[:i + 2]
+        controls_a = controls_a[:i + 1]
+        controls_d = controls_d[:i + 1]
+        values = values[:i + 2]
+        times = times[:i + 2]
+        break
+    left = [name for name, pos in (('attacker', pos_a), ('defender', pos_d))
+            if getattr(dynamics, 'box_loses', False) and np.max(np.abs(pos)) > dynamics.pos_range]
+    if left:   # the run's box rule: leaving the box loses for the leaver
+        outcome = "%s_left_box" % left[0]
         outcome_time = times[i + 1]
         trajectory = trajectory[:i + 2]
         controls_a = controls_a[:i + 1]
@@ -519,7 +586,8 @@ ax.grid(True, alpha=0.3)
 
 # --- Panel 3: value function ---
 ax = axes[0, 2]
-ax.set_title("Value function V(tMax - t, x(t))")
+ax.set_title("Value function V(%s, x(t))" % ('%.2f s' % args.fixed_time_to_go if args.fixed_time_to_go is not None
+                                               else 'tMax - t'))
 ax.set_xlabel("Time [s]")
 ax.set_ylabel("V")
 
@@ -532,8 +600,10 @@ ax.grid(True, alpha=0.3)
 
 # --- Panel 4: attacker control ---
 ax = axes[1, 0]
-attacker_policy = 'MPC' if attacker_uses_mpc else 'NN bang-bang'
-defender_policy = 'MPC' if defender_uses_mpc else 'NN bang-bang'
+mpc_name = 'MPC (own game model)' if independent_mpc else 'MPC'
+network_name = 'NN lookahead' if args.defender_policy == 'lookahead' else 'NN bang-bang'
+attacker_policy = mpc_name if attacker_uses_mpc else 'NN bang-bang'
+defender_policy = mpc_name if defender_uses_mpc else network_name
 ax.set_title(f"Attacker control ({attacker_policy})")
 ax.set_xlabel("Time [s]")
 ax.set_ylabel("Acceleration [m/s²]")
@@ -580,7 +650,8 @@ fig.suptitle(
     fontsize=13, fontweight="bold")
 fig.tight_layout()
 
-save_path = os.path.join(experiment_dir, f"{args.controller}_simulation_ckpt{args.checkpoint}.png")
+save_path = os.path.join(experiment_dir, f"{args.controller}_{args.mpc_opponent_model}-model_"
+                         f"{args.defender_policy}_simulation_ckpt{args.checkpoint}.png")
 fig.savefig(save_path, dpi=150, bbox_inches="tight")
 print(f"\nPlot saved to {save_path}")
 plt.show()

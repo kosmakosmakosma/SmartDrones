@@ -1,4 +1,5 @@
-"""Same start states, two games each, shown side by side: MPC vs MPC, and MPC attacker vs network defender.
+"""Same start states shown side by side: MPC vs MPC, and the same MPC attacker vs the network defender (one row per
+network controller given with --defender_policy, e.g. gradient lookahead).
 
 Both games use the library's MPC for the attacker: every --replan_every steps it plans the whole remaining game for
 both players with the max-min solver (pursuit plans, the defender's chase plans, the run's box rule, no network),
@@ -8,12 +9,12 @@ which the attacker knows nothing about. Games are played to the end and V is the
 the library's labels (> 0: defender wins); the first capture, target hit, keep-out breach or box exit is reported and
 the paths are drawn up to it.
 
-Figure (one column per scenario): top row MPC vs MPC, middle row MPC vs network, bottom row the network's value
-V(time-to-go, x(t)) along both games. Starts come from --start (repeatable) or are sampled like the library's
+Figure (one column per scenario): top row MPC vs MPC, then one row per network controller, bottom row the network's
+value V(time-to-go, x(t)) along all games of that start. Starts come from --start (repeatable) or are sampled like the library's
 'engagement' starts.
 
   .\\env\\Scripts\\python.exe -m utils.mpc_vs_network --experiment_name crazyflie_2d_mpc_3s_v6 --checkpoint 240000 ^
-      --setting 48x12 --defender_policy lookahead --num_scenarios 5
+      --setting 48x12 --defender_policy gradient lookahead --num_scenarios 5
 """
 
 import argparse
@@ -50,11 +51,12 @@ def first_events(dynamics, states):
     return event
 
 
-def play(starts, dynamics, defender, configs, args, generator):
-    """Plays 2N games: rows 0..N-1 MPC vs MPC, rows N..2N-1 MPC attacker vs network defender."""
+def play(starts, dynamics, defenders, configs, args, generator):
+    """Plays N games per mode: rows 0..N-1 MPC vs MPC, then N rows per network defender in `defenders`."""
     count = starts.shape[0]
     steps = int(round(args.game_time / args.dt))
-    states = torch.cat((starts, starts))
+    states = starts.repeat(1 + len(defenders), 1)
+    defender = defenders[0]   # the value is the same network for every controller
     batch = states.shape[0]
     trajectory = torch.zeros(batch, steps + 1, dynamics.state_dim, device=states.device)
     network_values = torch.zeros(batch, steps + 1, device=states.device)
@@ -75,7 +77,9 @@ def play(starts, dynamics, defender, configs, args, generator):
                 replace(configs['defender'], horizon_steps=remaining), generator)
             plan_u, plan_d, plan_start, offset = result.controls, result.defender_controls, step, 0
         u, d = plan_u[:, offset].clone(), plan_d[:, offset].clone()
-        d[count:] = defender.query(states[count:], None).disturbances
+        for index, network in enumerate(defenders, start=1):
+            rows = slice(index * count, (index + 1) * count)
+            d[rows] = network.query(states[rows], None).disturbances
         # games are played to the end (as for the library's labels); only the first event is recorded and drawn
         states = integrate_step(dynamics, states, u, d, args.dt, 'rk4')
         ended = event >= 0
@@ -95,16 +99,16 @@ def describe(event, event_step, dt, outcome):
     return '%s at %.2f s (%s wins)' % (name, event_step * dt, 'attacker' if name in ATTACKER_WINS else 'defender')
 
 
-def plot(path, trajectory, network_values, event, event_step, outcome, dynamics, args, title):
+def plot(path, trajectory, network_values, event, event_step, outcome, dynamics, args, title, modes):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    count = trajectory.shape[0] // 2
-    figure, axes = plt.subplots(3, count, figsize=(4.2 * count, 12.5), squeeze=False,
-                                gridspec_kw=dict(height_ratios=[1, 1, 0.7]))
+    count = trajectory.shape[0] // len(modes)
+    figure, axes = plt.subplots(len(modes) + 1, count, figsize=(4.2 * count, 4.3 * len(modes) + 3.9), squeeze=False,
+                                gridspec_kw=dict(height_ratios=[1] * len(modes) + [0.7]))
     limit = dynamics.pos_range
     for column in range(count):
-        for row, label in ((0, 'MPC vs MPC'), (1, 'MPC vs network')):
+        for row, label in enumerate(modes):
             game = column + row * count
             axis = axes[row, column]
             end = int(event_step[game]) + 1
@@ -130,12 +134,13 @@ def plot(path, trajectory, network_values, event, event_step, outcome, dynamics,
             axis.grid(alpha=0.3)
             if column == 0:
                 axis.legend(fontsize=7, loc='upper left')
-        axis = axes[2, column]
+        axis = axes[len(modes), column]
         times = torch.arange(trajectory.shape[1]) * args.dt
-        for row, style, label in ((0, '--', 'MPC vs MPC'), (1, '-', 'MPC vs network')):
+        for row, label in enumerate(modes):
             game = column + row * count
             end = int(event_step[game]) + 1
-            axis.plot(times[:end], network_values[game, :end], style, color='black' if row else 'gray', label=label)
+            axis.plot(times[:end], network_values[game, :end], '--' if row == 0 else '-',
+                      color='gray' if row == 0 else 'C%d' % row, label=label)
         axis.axhline(0, color='gray', lw=0.6)
         axis.set_xlabel('time [s]')
         axis.set_title('network V(%.1f s, x(t)) along the games' % args.time_to_go, fontsize=9)
@@ -144,7 +149,7 @@ def plot(path, trajectory, network_values, event, event_step, outcome, dynamics,
             axis.set_ylabel('V (> 0: defender wins)')
             axis.legend(fontsize=7)
     figure.suptitle(title, fontsize=11)
-    figure.tight_layout()
+    figure.tight_layout(rect=(0, 0, 1, 1 - 0.35 / figure.get_figheight()))
     figure.savefig(path, dpi=110)
     plt.close(figure)
 
@@ -167,7 +172,8 @@ def main():
     parser.add_argument('--noise_fraction', type=float, default=0.25)
     parser.add_argument('--chunk', type=int, default=48)
     parser.add_argument('--mpc_seed', type=int, default=0)
-    parser.add_argument('--defender_policy', default='gradient', choices=['gradient', 'lookahead'])
+    parser.add_argument('--defender_policy', nargs='+', default=['gradient'], choices=['gradient', 'lookahead'],
+                        help='network controller(s) for the defender, one row each, e.g. gradient lookahead')
     parser.add_argument('--lookahead_time', type=float, default=0.2)
     parser.add_argument('--time_to_go', type=float, default=None, help='fixed time-to-go of the network, default tMax')
     parser.add_argument('--safety_filter', type=lambda v: str(v).lower() in ('1', 'true', 'yes'), default=True)
@@ -180,8 +186,10 @@ def main():
         run_tmax = float(pickle.load(f).tMax)
     args.game_time = args.game_time or run_tmax
     args.time_to_go = args.time_to_go or run_tmax
-    defender = NetworkDefender(model, dynamics, device, policy=args.defender_policy, time_to_go=args.time_to_go,
-                               lookahead_time=args.lookahead_time, dt=args.dt, safety_filter=args.safety_filter)
+    defenders = [NetworkDefender(model, dynamics, device, policy=policy, time_to_go=args.time_to_go,
+                                 lookahead_time=args.lookahead_time, dt=args.dt, safety_filter=args.safety_filter)
+                 for policy in args.defender_policy]
+    modes = ['MPC vs MPC'] + ['MPC vs network %s' % policy for policy in args.defender_policy]
 
     if args.start:
         starts = torch.tensor(args.start, dtype=torch.float32)
@@ -197,27 +205,28 @@ def main():
                               mpc_defender_keep_out=True)
     configs = make_configs(dynamics, options, setting, args.chunk)
     generator = torch.Generator(device=device).manual_seed(args.mpc_seed)
-    print('playing %d scenarios x 2 games of %.2f s: MPC %s, network defender %s at time-to-go %.2f s%s' % (
-        starts.shape[0], args.game_time, setting_name(setting), args.defender_policy, args.time_to_go,
+    print('playing %d scenarios x %d games of %.2f s: MPC %s, network defender %s at time-to-go %.2f s%s' % (
+        starts.shape[0], len(modes), args.game_time, setting_name(setting), ' / '.join(args.defender_policy), args.time_to_go,
         ' with safety filter' if args.safety_filter else ''), flush=True)
-    trajectory, network_values, event, event_step, outcome = play(starts, dynamics, defender, configs, args, generator)
+    trajectory, network_values, event, event_step, outcome = play(starts, dynamics, defenders, configs, args, generator)
 
     count = starts.shape[0]
     for column in range(count):
         print('scenario %d  start %s' % (column, ' '.join('%+.2f' % v for v in starts[column].tolist())))
         print('    network V at start  %+.3f' % float(network_values[column, 0]))
-        for row, label in ((0, 'MPC vs MPC    '), (1, 'MPC vs network')):
+        for row, label in enumerate(modes):
             game = column + row * count
-            print('    %s  %s, V = %+.3f' % (label, describe(int(event[game]), int(event_step[game]), args.dt,
+            print('    %-26s  %s, V = %+.3f' % (label, describe(int(event[game]), int(event_step[game]), args.dt,
                                                          float(outcome[game])), float(outcome[game])))
     if args.safety_filter:
-        print('safety filter changed the network defender\'s action in %d of %d steps' % (
-            defender.safety_stats['changed'], defender.safety_stats['steps']))
+        for policy, network in zip(args.defender_policy, defenders):
+            print('safety filter changed the network %s defender\'s action in %d of %d steps' % (
+                policy, network.safety_stats['changed'], network.safety_stats['steps']))
     out = args.out or os.path.join(args.experiments_dir, args.experiment_name, 'mpc_vs_network_%s_%s%s.png' % (
-        setting_name(setting), args.defender_policy, '_safe' if args.safety_filter else ''))
+        setting_name(setting), '_'.join(args.defender_policy), '_safe' if args.safety_filter else ''))
     plot(out, trajectory, network_values, event, event_step, outcome, dynamics, args,
-         '%s, checkpoint %s: attacker MPC %s vs MPC defender (top) and vs network %s defender (middle)' % (
-             args.experiment_name, args.checkpoint, setting_name(setting), args.defender_policy))
+         '%s, checkpoint %s: attacker MPC %s vs MPC defender (top row) and vs the network defender (%s)' % (
+             args.experiment_name, args.checkpoint, setting_name(setting), ', '.join(args.defender_policy)), modes)
     print('figure -> %s' % out)
 
 
